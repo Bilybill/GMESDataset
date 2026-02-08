@@ -1,0 +1,31 @@
+# Gravity forward modeling config for density_1.npy
+simulation:
+  device: cuda
+
+model:
+  # Density model path
+  file_path: /home/wangyh/DATAFOLDER/GraExample/density_1.npy
+  # Shape is (nx, ny, nz)
+  shape: [80, 80, 20]
+  dx: 100.0
+  dy: 100.0
+  dz: 100.0
+  default_density: 0.0 # Assuming this is density difference/anomaly, 0 background? Original said 2670. User said "density difference" (密度差).
+
+gravity:
+  heights_m: [0.0]          # observation height above surface (m)
+  output_unit: mgal         # si / mgal / ugal
+  pad_factor: 2
+  G: 6.67430e-11
+
+  observation:
+    layout: grid
+    n_x: 80
+    n_y: 80
+    first_x: 0
+    first_y: 0
+    d_x: 1
+    d_y: 1
+
+output:
+  save_path: /home/wangyh/DATAFOLDER/GraExample/gravity_density_1.npz

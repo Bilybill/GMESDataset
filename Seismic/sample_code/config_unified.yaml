@@ -1,0 +1,117 @@
+# Unified configuration example (compatible with utils_unified.setup_acquisition)
+#
+# IMPORTANT dimension convention (matches acquisition code):
+#   2D: v.shape == [nx, nz]          (x is dim0, z is dim1)
+#   3D: v.shape == [nx, ny, nz]      (x is dim0, y is dim1, z is dim2)
+#
+simulation:
+  mode: "3D"        # "2D" or "3D"
+  device: "cuda"    # "cuda" or "cpu"
+  accuracy: 4
+
+model:
+  file_path: "velocity_model.npy"
+  shape: [256, 256, 256]   # [nx, ny, nz]  (x*y*z)
+  dx: 10.0
+  dy: 10.0
+  dz: 12.5
+
+  # Optional (only used if your .npz has formatS/formatD/gtime)
+  trends_range: [2000, 6000]
+  details_range: [-500, 1000]
+  mdetails_range: [-200, 200]
+
+time:
+  nt: 1000
+  dt: 0.001
+
+# Global acquisition behaviors
+acquisition:
+  default_y: "center"   # if y not specified for 3D line layouts
+  oob_policy: "error"   # "error" (recommended) or "clamp"
+
+source:
+  type: "ricker"
+  freq: 25
+  amplitude: 1.0
+
+  # ---- Source layouts ----
+  # layout: "line" (backward compatible), "grid", "points"
+  layout: "grid"
+  source_depth: 2
+
+  # grid shots (3D)
+  n_shots_x: 11
+  n_shots_y: 11
+  first_source_x: 24
+  first_source_y: 24
+  d_source_x: 20
+  d_source_y: 20
+
+  # (Optional) line shots (backward compatible)
+  # layout: "line"
+  # n_shots: 50
+  # first_source: 24
+  # d_source: 10
+  # source_y: "center"
+
+  # (Optional) explicit points
+  # layout: "points"
+  # locations:
+  #   - [128, 128, 2]   # [x,y,z] in 3D
+  #   - [148, 128, 2]
+
+receiver:
+  receiver_depth: 2
+
+  # ---- Receiver types ----
+  # type: "fixed" (default/back-compat), "rolling", "patch"
+  type: "fixed"
+
+  # ---- Receiver layouts ----
+  # layout: "line" (default/back-compat) or "grid"
+  layout: "grid"
+
+  # fixed grid receivers (3D) -> flattened automatically to n_receivers_per_shot
+  n_receivers_x: 33
+  n_receivers_y: 33
+  first_receiver_x: 24
+  first_receiver_y: 24
+  d_receiver_x: 4
+  d_receiver_y: 4
+
+  # (Optional) fixed line (backward compatible)
+  # layout: "line"
+  # n_receivers_per_shot: 150
+  # first_receiver: 10
+  # d_receiver: 1
+  # receiver_y: "center"
+
+  # (Optional) rolling spread line (relative to each shot)
+  # type: "rolling"
+  # layout: "line"
+  # n_receivers_per_shot: 256
+  # offset_first: 10
+  # d_offset: 2
+  # receiver_y_offset: 0
+
+  # (Optional) patch window line
+  # type: "patch"
+  # layout: "line"
+  # patch_half_span: 80
+  # patch_d: 2
+  # min_offset: 10
+
+  # (Optional) patch window grid (3D local areal patch)
+  # type: "patch"
+  # layout: "grid"
+  # patch_half_span_x: 80
+  # patch_half_span_y: 40
+  # patch_d_x: 2
+  # patch_d_y: 5
+  # min_offset: 10
+  # patch_mask: "circle"      # "box" or "circle"
+  # patch_radius_m: 800       # required if circle
+
+output:
+  save_path: "shot_gathers.npy"
