@@ -44,10 +44,11 @@ def read_segy_volume(path):
 
 def main():
     print("=== GMESDataset Igneous Intrusion Demo (Swarm & Stock) ===")
-
+    DATA_PREFIX = "/home/wyh/wyhHDD/Project/3DSeismic/AYLModel/3DExample"
     # Configuration for external SEGY files
-    vp_segy_path = "/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Velocity_choas/braided/AYL-00000.sgy"
-    label_segy_path = "/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Layer_choas/braided/AYL-00000.sgy"
+    vp_segy_path = os.path.join(DATA_PREFIX, "Velocity_choas/braided/AYL-00000.sgy")
+    label_segy_path = os.path.join(DATA_PREFIX, "Layer_choas/braided/AYL-00000.sgy")
+    SAVE_PREFIX = "/home/wyh/wyhHDD/Project/3DSeismic/Cache"
     
     use_segy = segyio is not None and os.path.exists(vp_segy_path) and os.path.exists(label_segy_path)
 
@@ -289,25 +290,8 @@ def main():
     vp_final, mask_final, _, _, _ = builder.inject_anomalies(vp_bg, anomalies)
 
     print(f"   Final Vp min/max: {vp_final.min():.1f} / {vp_final.max():.1f}")
-    
-    # 5. Visualization with CigVis
-    print("4. Visualizing result...")
-    
-    # Prepare visualization
-    nodes = []
-    
-    # Background Vp
-    # create_slices returns a list of nodes
-    try:
-        nodes += cigvis.create_slices(
-            vp_final,
-            cmap='jet'
-        )
-        
-    except Exception as e:
-        print(f"Warning: Could not create slices: {e}")
 
-    # --- Generate Subtype Labels for HC/Hydrate Anomaly ---
+    # --- Generate Subtype Labels for HC/Hydrate Anomaly & Save Models ---
     print("   Generating fine-grained subtype labels for Hydrocarbon/Hydrate...")
     nx, ny, nz = vp_bg.shape
     x = np.arange(nx) * dx
@@ -355,6 +339,40 @@ def main():
     merged_sub = np.where(sub_hyd > 0, sub_hyd, merged_sub)
     merged_sub = np.where(sub_brine_viz > 0, sub_brine_viz, merged_sub)
     merged_sub = np.where(sub_serp > 0, sub_serp, merged_sub)
+
+    # --- Save Models to Disk ---
+    if not os.path.exists(SAVE_PREFIX):
+        os.makedirs(SAVE_PREFIX, exist_ok=True)
+        print(f"   Created directory: {SAVE_PREFIX}")
+
+    print(f"   Saving models to {SAVE_PREFIX}...")
+    try:
+        np.save(os.path.join(SAVE_PREFIX, "vp_final.npy"), vp_final)
+        np.save(os.path.join(SAVE_PREFIX, "rho_final.npy"), rho_sbi)
+        np.save(os.path.join(SAVE_PREFIX, "res_final.npy"), res_final)
+        np.save(os.path.join(SAVE_PREFIX, "chi_final.npy"), chi_sbi)
+        np.save(os.path.join(SAVE_PREFIX, "label_final.npy"), merged_sub)
+        print("   Models saved successfully.")
+    except Exception as e:
+        print(f"   Error saving models: {e}")
+
+    
+    # 5. Visualization with CigVis
+    print("4. Visualizing result...")
+    
+    # Prepare visualization
+    nodes = []
+    
+    # Background Vp
+    # create_slices returns a list of nodes
+    try:
+        nodes += cigvis.create_slices(
+            vp_final,
+            cmap='jet'
+        )
+        
+    except Exception as e:
+        print(f"Warning: Could not create slices: {e}")
 
     try:
         # 1. Standard anomalies from mask_final (if any others were added)
@@ -408,7 +426,7 @@ def main():
             if code not in uni_sub: continue
             
             # (Filter removed to show all types)
-            if code != 40 and code != 41: continue
+            # if code != 40 and code != 41: continue
 
             name = sub_names.get(code, f'Type{code}')
             print(f"   Render Subtype {code}: {name} ({c})...")
