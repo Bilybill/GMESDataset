@@ -7,7 +7,7 @@ import numpy as np
 from loguru import logger
 
 from utils import load_config, load_susceptibility_model
-from mag_forward import forward_mag_tmi
+from wyhHDD.Project.GMESDataset.Magnetic.sample_code.mag_forward_GPT import forward_mag_tmi
 
 def main():
     parser = argparse.ArgumentParser(description="Magnetic Forward Modeling (Unified Config Style)")
