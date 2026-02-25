@@ -82,14 +82,6 @@ def _normalize(arr: np.ndarray) -> np.ndarray:
 def _mae(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean(np.abs(a - b)))
 
-
-def compare_results():
-    # 1. Setup Model (Same as MATLAB sample)
-    nx, ny, nz = 20, 20, 10
-    dx, dy, dz = 100., 100., 100.
-    
-    model = np.zeros((nx, ny, nz))
-    # Fill some blocks (near top)
 def compare_results():
     # 1. Setup Model (Same as MATLAB sample)
     nx, ny, nz = 20, 20, 10
@@ -120,8 +112,6 @@ def compare_results():
         tmi_gpu_t, _ = forward_mag_tmi(
             torch.from_numpy(model).float(), dx, dy, dz,
             heights_m=[0], obs_conf=obs_conf,
-            input_type=input_type,
-            B0=50000, I_deg=90, A_deg=0,
             output_unit="nt"
         )
         tmi_gpu = tmi_gpu_t[0, 0].cpu().numpy()

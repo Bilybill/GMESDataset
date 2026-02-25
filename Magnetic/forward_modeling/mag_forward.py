@@ -208,13 +208,80 @@ def forward_mag_tmi(
     K_abs[0, 0] = 1.0 # Avoid div by zero, we will zero out the term later if needed
     
     # ---- Earth filter (wavenumber-domain operator for TMI) ----
-    # A common (Blakely-style) expression for total-field anomaly in 2D Fourier domain is:
-    #   E(U,V) = ((m_x U + m_y V + i m_z K) * (f_x U + f_y V + i f_z K)) / K^2
-    # where K = sqrt(U^2 + V^2).
-    # For susceptibility χ (dimensionless), the overall scale becomes (B0_T/2) in Tesla.
-    K2 = K_abs ** 2
-    K2[0, 0] = 1.0
-    earth_filter = ((mx * U + my * V + 1j * mz * K_abs) * (fx * U + fy * V + 1j * fz * K_abs)) / K2
+    # A common (Blakely-style) expression for total-field anomaly in 2D Fourier domain.
+    # The potential phi(k) is proportional to M(k) * ( i*mx*u + i*my*v + mz*k ) * exp(-k|z|) / k
+    # The field T(k) is - grad(phi) dot F = phi(k) * ( i*fx*u + i*fy*v + fz*k )
+    # Note: vertical derivative in wavenumber domain is |k| (for sources below observation).
+    #
+    # With z positive down:
+    # Horizontal derivatives: d/dx -> i*u, d/dy -> i*v
+    # Vertical derivative:    d/dz -> k  (because potential decays as exp(-k|z|), and we look at z<0 region relative to source?)
+    # Actually, standard reformulation:
+    # Theta_m = i*mx*u + i*my*v + mz*K_abs
+    # Theta_f = i*fx*u + i*fy*v + fz*K_abs
+    # Filter = (Theta_m * Theta_f) / K_abs  (Not K^2, one K cancels with potential's 1/K)
+    #
+    # But we perform integration over dz (1/k factor from integration of exp(-kz)) later?
+    # No, the layer integration (exp(-kz1) - exp(-kz2)) already brings a 1/K factor implicitly? 
+    # Let's check the layer factor: exp_top - exp_bot.
+    # Integral of e^{-kz} is -1/k e^{-kz}. So (exp_top - exp_bot) corresponds to integral * k ? No.
+    #
+    # Let's stick to the "layer density" approach.
+    # Gravity/Mag potential of a layer: G = 2*pi*G * density * (exp(-k z_top) - exp(-k z_bot))/k
+    # Here we sum (exp - exp). This lacks the 1/k factor if we consider it density.
+    #
+    # Revised formula:
+    # factor = 1/K_abs
+    # term_m = 1j * (mx * U + my * V) + mz * K_abs
+    # term_f = 1j * (fx * U + fy * V) + fz * K_abs
+    # earth_filter = factor * term_m * term_f
+    
+    # Updated formula:
+    # Scale K term
+    # earth_filter: order K (Field)
+    # The term (i*mx*u + i*my*v + mz*k) is (i*k_vec dot M).
+    # The term (i*fx*u + i*fy*v + fz*k) is (i*k_vec dot F).
+    # We divide by k because the Green's function for potential is 2*pi/k * exp(-kz).
+    # So Field ~ (k dot M)(k dot F) * (1/k) * exp(-kz).
+    
+    # K_abs handles the 1/k factor.
+    # We apply a mask to avoid division by zero at k=0.
+    K_inv = torch.zeros_like(K_abs)
+    msk = K_abs > 1e-10
+    K_inv[msk] = 1.0 / K_abs[msk]
+
+    # Note signs:
+    # u,v are wavenumbers. Spatial derivative d/dx -> i*u.
+    # Vertical derivative d/dz -> k (for z positive down, source below obs).
+    # Potential V ~ -div(M/r) -> - M dot grad(1/r).
+    # Fourier transform of 1/r is 2*pi/k * exp(-k|z|).
+    # grad(1/r) -> (iu, iv, k) * (2*pi/k) exp(-kz) ?
+    # Actually, usually d/dz -> |k|.
+    # So Term_M = i*mx*U + i*my*V + mz*K_abs.
+    # And Term_F = i*fx*U + i*fy*V + fz*K_abs.
+    # Wait, B = -grad V.
+    # So B_fixed_comp = - F dot grad V.
+    # So another (iu, iv, k) dot F.
+    # Total: - (Term_M) * (Term_F) / K_abs ? 
+    # Or + ?
+    # Let's check a standard reference (e.g. Blakely).
+    # Blakely uses z positive down.
+    # B = Cm * sum [ theta_m * theta_f * exp(-k*z0) * (1 - exp(-k*t)) / k ] * sum ...
+    # theta_m = m_z*k + i*(m_x*u + m_y*v).
+    # theta_f = f_z*k + i*(f_x*u + f_y*v).
+    # This matches my Term_M and Term_F.
+    # The factor is 1/k.
+    # The overall constant is Cm = mu0 / 4pi = 10^-7.
+    # My constant is 0.5 * mu0 = 2*pi * 10^-7.
+    # Blakely has 2*pi from Fourier definition? Yes, 2*pi * Cm = 0.5 * mu0. (Correct).
+    # Signs?
+    # B = 2*pi*Cm * ...
+    # It appears positive.
+    
+    term_m = 1j * (mx * U + my * V) + mz * K_abs
+    term_f = 1j * (fx * U + fy * V) + fz * K_abs
+    
+    earth_filter = term_m * term_f * K_inv
     earth_filter[0, 0] = 0.0
     
     # Precompute RFFT of layers?
@@ -256,6 +323,30 @@ def forward_mag_tmi(
         out = torch.zeros((1, len(heights), x_idx.numel(), y_idx.numel()), device=device, dtype=torch.float32)
     else:
         out = torch.zeros((1, len(heights), x_idx.numel()), device=device, dtype=torch.float32)
+
+    # Scale factor from standard FFT definition on discrete grids.
+    # The continuous Fourier transform F(k) is related to discrete F[k] by dx*dy factor.
+    # i.e. Integral f(x) e^{-ikx} dx ~ Sum f(n) e^{-ikn} * dx
+    # So F_continuous ~ F_discrete * dx * dy.
+    # We need to multiply by dx * dy when moving to frequency domain to match physical units.
+    # Or multiply by dx*dy after IFFT?
+    # Actually, if we view it as convolution:
+    # f * g = IFFT( FFT(f) * FFT(g) ) ?
+    # In discrete: (f * g)[n] = sum f[k] g[n-k].
+    # In continuous: (f * g)(x) = int f(u) g(x-u) du ~ sum f(k) g(n-k) * dx.
+    # So we need one factor of cell area (dx*dy) for the convolution integral.
+    # Since our earth_filter is the continuous transfer function evaluated at discrete k,
+    # we effectively are doing: Result = IFFT( FFT(Model) * TransferFunction ).
+    # This corresponds to discrete convolution of Model with (IFFT(TransferFunction)).
+    # But the physical convolution integral needs a `dV` factor.
+    # Since we integrate over z analytically (giving the 1/k and exp factors), we are left with x,y integration.
+    # So we need a factor of (dx * dy).
+    
+    # Let's apply this scaling.
+    scale_xy = dx * dy
+    
+    # Combined scaling
+    scale *= scale_xy
 
     for hi, h in enumerate(heights):
         # Observation height h (meters above surface). 
