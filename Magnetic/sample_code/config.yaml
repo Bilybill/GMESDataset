@@ -1,0 +1,43 @@
+# Example configuration for magnetic forward modeling
+
+simulation:
+  device: cpu   # use 'cuda' if you have a GPU
+
+model:
+  # If file_path is missing, code will generate a synthetic cube model.
+  # Provide shape to control synthetic model size.
+  shape: [64, 64, 32]
+  dx: 10.0
+  dy: 10.0
+  dz: 10.0
+  # file_path: "./models/susceptibility.npy"
+  # npz_key: "susceptibility"
+
+magnetic:
+  # Choose mode:
+  # - standard_B: standard spectral-domain formulation (for papers/inversion)
+  # - prism_matched: matches the provided MATLAB prism operator (for regression tests)
+  mode: standard_B
+
+  input_type: susceptibility   # 'susceptibility' or 'magnetization'
+  output_unit: nt
+
+  B0: 50000.0
+  inclination: 60.0
+  declination: 0.0
+
+  # Optional remanence magnetization direction
+  # mag_inclination: 60.0
+  # mag_declination: 0.0
+
+  heights_m: [0.0]
+  pad_factor: 2
+
+observation:
+  layout: grid
+  # If omitted, defaults to full grid size
+  # n_x: 64
+  # n_y: 64
+
+output:
+  save_path: output/magnetic_data.npz

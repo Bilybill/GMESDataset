@@ -16,6 +16,7 @@ magnetic:
   inclination: 90.0     # Geomagnetic Inclination (degrees)
   declination: 0.0      # Geomagnetic Declination (degrees)
   input_type: susceptibility  # susceptibility (dimensionless SI χ) or magnetization (A/m)
+  mode: standard_B            # standard_B (spectral domain) or prism_matched (MATLAB-like reference)
   
   # Optional: Remanent magnetization direction
   # mag_inclination: 45.0

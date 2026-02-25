@@ -1,6 +1,13 @@
 import torch
 import math
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+
+
+def _next_pow2(n: int) -> int:
+    """Return the next power-of-two >= n (for FFT padding)."""
+    if n <= 1:
+        return 1
+    return 1 << (int(n - 1).bit_length())
 
 def _unit_scale(output_unit: str) -> float:
     """
@@ -57,6 +64,119 @@ def _make_obs_indices(nx: int, ny: int, obs_conf: Dict) -> Tuple[torch.Tensor, t
 
     raise ValueError(f"Unknown observation.layout: {layout}")
 
+
+# -----------------------------
+# Prism-matched kernel (for unit-testing against the provided MATLAB prism code)
+# -----------------------------
+
+_PRISM_T_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
+
+
+def _build_prism_T_kernel(
+    nx: int,
+    ny: int,
+    nz: int,
+    dx: float,
+    dy: float,
+    dz: float,
+    h: float,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build the T kernel identical to MATLAB `fun_forward_mag.m`.
+
+    Returns a tensor T with shape (2*nx-1, 2*ny-1, nz).
+
+    This is used only in mode="prism_matched" to reproduce the MATLAB reference operator.
+    """
+    key = (
+        "T_prism_v1",
+        nx, ny, nz,
+        float(dx), float(dy), float(dz), float(h),
+        str(device), str(dtype),
+    )
+    if key in _PRISM_T_CACHE:
+        return _PRISM_T_CACHE[key]
+
+    # MATLAB definitions:
+    # x0=-(nx-1)*dx:dx:(nx-1)*dx;
+    # y0=-(ny-1)*dy:dy:(ny-1)*dy;
+    # z0=-(nz*dz+h):dz:-(dz+h);
+    x0 = torch.arange(-(nx - 1) * dx, (nx - 1) * dx + 0.5 * dx, dx, device=device, dtype=dtype)
+    y0 = torch.arange(-(ny - 1) * dy, (ny - 1) * dy + 0.5 * dy, dy, device=device, dtype=dtype)
+    z0 = torch.arange(-(nz * dz + h), -(dz + h) + 0.5 * dz, dz, device=device, dtype=dtype)
+
+    Ai = torch.tensor([-dx / 2.0, dx / 2.0], device=device, dtype=dtype)
+    Bj = torch.tensor([-dy / 2.0, dy / 2.0], device=device, dtype=dtype)
+    Ck = torch.tensor([0.0, dz], device=device, dtype=dtype)
+
+    X0, Y0 = torch.meshgrid(x0, y0, indexing="ij")
+    X0 = X0.unsqueeze(-1)  # (2nx-1, 2ny-1, 1)
+    Y0 = Y0.unsqueeze(-1)
+
+    T = torch.zeros((2 * nx - 1, 2 * ny - 1, nz), device=device, dtype=dtype)
+
+    for i in range(2):
+        for j in range(2):
+            for k in range(2):
+                # MATLAB: uijk = (-1)^(i+j+k) with 1-based indices
+                uijk = (-1.0) ** ((i + 1) + (j + 1) + (k + 1))
+
+                X = X0 + Ai[i]
+                Y = Y0 + Bj[j]
+                Z = (z0 + Ck[k]).view(1, 1, nz)
+
+                R = torch.sqrt(X * X + Y * Y + Z * Z)
+                denom = Z * R
+                denom = torch.where(torch.abs(denom) < 1e-30, torch.full_like(denom, 1e-30), denom)
+                ratio = (X * Y) / denom
+                term = torch.atan(ratio)
+                term = torch.nan_to_num(term, nan=0.0, posinf=0.0, neginf=0.0)
+                T = T + (-uijk) * term
+
+    _PRISM_T_CACHE[key] = T
+    return T
+
+
+def _prism_matched_forward_fullgrid(
+    J: torch.Tensor,
+    dx: float,
+    dy: float,
+    dz: float,
+    height_m: float,
+) -> torch.Tensor:
+    """Prism-matched forward (full grid), reproducing MATLAB's Ta*M (before unit scaling).
+
+    J: magnetization intensity (A/m), shape (nx,ny,nz).
+    Returns: (nx,ny) tensor.
+    """
+    nx, ny, nz = J.shape
+    device = J.device
+    dtype = J.dtype
+
+    T = _build_prism_T_kernel(nx, ny, nz, dx, dy, dz, height_m, device=device, dtype=dtype)
+    # MATLAB mapping: q (deep->shallow) uses model layer (nz-1-q)
+    J_rev = torch.flip(J, dims=(2,))
+
+    kx = 2 * nx - 1
+    ky = 2 * ny - 1
+    nx_full = kx + nx - 1
+    ny_full = ky + ny - 1
+    nx_fft = _next_pow2(nx_full)
+    ny_fft = _next_pow2(ny_full)
+
+    # Batch FFT over z (keep z as batch dimension)
+    T_hat = torch.fft.rfft2(T, s=(nx_fft, ny_fft), dim=(0, 1))
+    J_hat = torch.fft.rfft2(J_rev, s=(nx_fft, ny_fft), dim=(0, 1))
+    total_hat = torch.sum(T_hat * J_hat, dim=2)
+    conv_full = torch.fft.irfft2(total_hat, s=(nx_fft, ny_fft))
+    conv_lin = conv_full[:nx_full, :ny_full]
+
+    start_x = nx - 1
+    start_y = ny - 1
+    out = conv_lin[start_x:start_x + nx, start_y:start_y + ny]
+    return out
+
 def calculate_h_kernel_fft(
     nx: int, ny: int, nz: int,
     dx: float, dy: float, dz: float,
@@ -94,43 +214,40 @@ def forward_mag_tmi(
     M_A_deg: Optional[float] = None, # Declination of magnetization
     output_unit: str = "nt",
     pad_factor: int = 2,
+    mode: str = "standard_B",
 ) -> Tuple[torch.Tensor, Dict]:
-    """ 
-    Magnetic forward modeling (TMI: total magnetic intensity anomaly) for a 3D **susceptibility** model.
+    """Magnetic forward modeling.
+
+    Supported modes
+    ---------------
+    mode="standard_B":
+        Standard spectral-domain (wavenumber-domain) formulation (route-B). This is the one you
+        should use for formal usage (papers / inversion).
+
+    mode="prism_matched":
+        Prism-kernel matched *reference* operator that reproduces the provided MATLAB
+        `fun_forward_mag.m`/`forward_mag.m` behavior (up to numerical precision). This mode is
+        intended for unit tests / regression tests, not for scientific reporting.
 
     Parameters
     ----------
-    input_type:
-        - "susceptibility" (default): input is dimensionless SI susceptibility χ.
-          The forward operator assumes induced magnetization magnitude J = χ · H0 with H0 = B0/μ0.
-        - "magnetization": input is magnetization intensity J (A/m). In this mode, the result does NOT
-          depend on B0 for amplitude scaling (only for direction via I_deg/A_deg).
-
-    Notes
-    -----
-    For the default (susceptibility) mode, induced magnetization magnitude is proportional to the
-    inducing field strength:
-
-        H0 = B0 / μ0   (A/m),   B0 is the inducing field magnitude (Tesla), μ0 = 4π×10⁻⁷.
-        J = χ · H0     (A/m)
-
-    The output is the total-field anomaly (projection of the anomalous field onto the inducing field direction).
-
     susceptibility: (nx, ny, nz)
         - if input_type="susceptibility": dimensionless SI susceptibility χ
         - if input_type="magnetization": magnetization intensity J in A/m
-    dx, dy, dz: cell sizes in meters.
-    heights_m: list of observation heights (positive upwards, z=0 is surface).
-    obs_conf: observation layout config.
-    B0: Geomagnetic field magnitude in nT.
-    I_deg: Geomagnetic Inclination in degrees.
-    A_deg: Geomagnetic Declination in degrees.
-    M_I_deg: Magnetization Inclination (default to I_deg i.e., induced only).
-    M_A_deg: Magnetization Declination (default to A_deg).
-    
-    Returns:
-       data: (1, n_heights, ...) TMI anomaly in output_unit ("nt" or "si")
-       meta: dict
+    input_type:
+        - "susceptibility" (default): treats the input as χ and uses induced magnetization
+          J = χ · H0 with H0 = B0/μ0.
+        - "magnetization": treats the input as J (A/m).
+    output_unit:
+        "nt" (nT) or "si" (Tesla).
+
+    Returns
+    -------
+    data:
+        - layout="grid": (1, n_heights, n_x, n_y)
+        - layout="points": (1, n_heights, n_points)
+    meta:
+        dictionary with geometry and run settings.
     """
     
     if susceptibility.ndim != 3:
@@ -180,6 +297,63 @@ def forward_mag_tmi(
 
     heights = [float(h) for h in (heights_m or [0.0])]
 
+    mode_l = str(mode).strip().lower()
+
+    # -----------------------------
+    # mode = prism_matched (reference operator matching MATLAB prism code)
+    # -----------------------------
+    if mode_l in {"prism_matched", "prism", "matlab"}:
+        input_type_l = str(input_type).strip().lower()
+        sus_t = susceptibility.to(torch.float32)
+
+        if input_type_l in {"susceptibility", "chi", "kappa"}:
+            # Convert susceptibility -> induced magnetization intensity J (A/m)
+            H0 = B0_T / mu0
+            J = sus_t * float(H0)
+        elif input_type_l in {"magnetization", "j", "m"}:
+            J = sus_t
+        else:
+            raise ValueError(f"Unknown input_type={input_type!r}. Use 'susceptibility' or 'magnetization'.")
+
+        # MATLAB uses G_T = 1e2 * T, which equals (mu0/4pi)=1e-7 Tesla converted to nT.
+        u_out = (output_unit or "nt").lower()
+        if u_out in {"nt", "nanotesla"}:
+            prism_scale = 100.0
+        elif u_out == "si":
+            prism_scale = 1e-7
+        else:
+            raise ValueError(f"Unknown output_unit: {output_unit}")
+
+        if layout == "grid":
+            out = torch.zeros((1, len(heights), x_idx.numel(), y_idx.numel()), device=device, dtype=torch.float32)
+        else:
+            out = torch.zeros((1, len(heights), x_idx.numel()), device=device, dtype=torch.float32)
+
+        for hi, h in enumerate(heights):
+            full = _prism_matched_forward_fullgrid(J, dx=dx, dy=dy, dz=dz, height_m=h) * prism_scale
+            if layout == "grid":
+                out[0, hi] = full.index_select(0, x_idx).index_select(1, y_idx)
+            else:
+                out[0, hi] = full[x_idx, y_idx]
+
+        meta = {
+            "mode": "prism_matched",
+            "layout": layout,
+            "obs_x_idx": x_idx.detach().cpu(),
+            "obs_y_idx": y_idx.detach().cpu(),
+            "heights_m": torch.tensor(heights, dtype=torch.float32),
+            "dx": torch.tensor([dx, dy, dz], dtype=torch.float32),
+            "mu0": mu0,
+            "B0": B0,
+            "I": I_deg,
+            "A": A_deg,
+            "input_type": input_type_l,
+            "output_unit": output_unit,
+            "pad_factor": None,
+            "model_shape": (nx, ny, nz),
+        }
+        return out, meta
+
     # Padded dimensions for FFT
     nx_pad = int(pad_factor) * nx
     ny_pad = int(pad_factor) * ny
@@ -206,82 +380,25 @@ def forward_mag_tmi(
     # Usually we set K=0 to a small value or handle explicitly. 
     # But let's look at the multiplier.
     K_abs[0, 0] = 1.0 # Avoid div by zero, we will zero out the term later if needed
-    
-    # ---- Earth filter (wavenumber-domain operator for TMI) ----
-    # A common (Blakely-style) expression for total-field anomaly in 2D Fourier domain.
-    # The potential phi(k) is proportional to M(k) * ( i*mx*u + i*my*v + mz*k ) * exp(-k|z|) / k
-    # The field T(k) is - grad(phi) dot F = phi(k) * ( i*fx*u + i*fy*v + fz*k )
-    # Note: vertical derivative in wavenumber domain is |k| (for sources below observation).
-    #
-    # With z positive down:
-    # Horizontal derivatives: d/dx -> i*u, d/dy -> i*v
-    # Vertical derivative:    d/dz -> k  (because potential decays as exp(-k|z|), and we look at z<0 region relative to source?)
-    # Actually, standard reformulation:
-    # Theta_m = i*mx*u + i*my*v + mz*K_abs
-    # Theta_f = i*fx*u + i*fy*v + fz*K_abs
-    # Filter = (Theta_m * Theta_f) / K_abs  (Not K^2, one K cancels with potential's 1/K)
-    #
-    # But we perform integration over dz (1/k factor from integration of exp(-kz)) later?
-    # No, the layer integration (exp(-kz1) - exp(-kz2)) already brings a 1/K factor implicitly? 
-    # Let's check the layer factor: exp_top - exp_bot.
-    # Integral of e^{-kz} is -1/k e^{-kz}. So (exp_top - exp_bot) corresponds to integral * k ? No.
-    #
-    # Let's stick to the "layer density" approach.
-    # Gravity/Mag potential of a layer: G = 2*pi*G * density * (exp(-k z_top) - exp(-k z_bot))/k
-    # Here we sum (exp - exp). This lacks the 1/k factor if we consider it density.
-    #
-    # Revised formula:
-    # factor = 1/K_abs
-    # term_m = 1j * (mx * U + my * V) + mz * K_abs
-    # term_f = 1j * (fx * U + fy * V) + fz * K_abs
-    # earth_filter = factor * term_m * term_f
-    
-    # Updated formula:
-    # Scale K term
-    # earth_filter: order K (Field)
-    # The term (i*mx*u + i*my*v + mz*k) is (i*k_vec dot M).
-    # The term (i*fx*u + i*fy*v + fz*k) is (i*k_vec dot F).
-    # We divide by k because the Green's function for potential is 2*pi/k * exp(-kz).
-    # So Field ~ (k dot M)(k dot F) * (1/k) * exp(-kz).
-    
-    # K_abs handles the 1/k factor.
-    # We apply a mask to avoid division by zero at k=0.
-    K_inv = torch.zeros_like(K_abs)
-    msk = K_abs > 1e-10
-    K_inv[msk] = 1.0 / K_abs[msk]
 
-    # Note signs:
-    # u,v are wavenumbers. Spatial derivative d/dx -> i*u.
-    # Vertical derivative d/dz -> k (for z positive down, source below obs).
-    # Potential V ~ -div(M/r) -> - M dot grad(1/r).
-    # Fourier transform of 1/r is 2*pi/k * exp(-k|z|).
-    # grad(1/r) -> (iu, iv, k) * (2*pi/k) exp(-kz) ?
-    # Actually, usually d/dz -> |k|.
-    # So Term_M = i*mx*U + i*my*V + mz*K_abs.
-    # And Term_F = i*fx*U + i*fy*V + fz*K_abs.
-    # Wait, B = -grad V.
-    # So B_fixed_comp = - F dot grad V.
-    # So another (iu, iv, k) dot F.
-    # Total: - (Term_M) * (Term_F) / K_abs ? 
-    # Or + ?
-    # Let's check a standard reference (e.g. Blakely).
-    # Blakely uses z positive down.
-    # B = Cm * sum [ theta_m * theta_f * exp(-k*z0) * (1 - exp(-k*t)) / k ] * sum ...
-    # theta_m = m_z*k + i*(m_x*u + m_y*v).
-    # theta_f = f_z*k + i*(f_x*u + f_y*v).
-    # This matches my Term_M and Term_F.
-    # The factor is 1/k.
-    # The overall constant is Cm = mu0 / 4pi = 10^-7.
-    # My constant is 0.5 * mu0 = 2*pi * 10^-7.
-    # Blakely has 2*pi from Fourier definition? Yes, 2*pi * Cm = 0.5 * mu0. (Correct).
-    # Signs?
-    # B = 2*pi*Cm * ...
-    # It appears positive.
-    
+
+
+    # ---- Earth filter (wavenumber-domain operator for TMI) ----
+    # Standard (route-B) spectral-domain expression (Blakely-style) for total-field anomaly:
+    #
+    #   Theta_m = i*(m_x*kx + m_y*ky) + m_z*k
+    #   Theta_f = i*(f_x*kx + f_y*ky) + f_z*k
+    #   Filter  = (Theta_m * Theta_f) / k^2
+    #
+    # and each slab contributes (e^{-k(z_top+h)} - e^{-k(z_bot+h)}).
+    #
+    # Notes:
+    # - We use angular wavenumbers kx,ky in rad/m (u,v computed via 2π*fftfreq).
+    # - DC (k=0) is set to zero.
+    K_sq[0, 0] = 1.0  # avoid division by zero; we will force DC to 0
     term_m = 1j * (mx * U + my * V) + mz * K_abs
     term_f = 1j * (fx * U + fy * V) + fz * K_abs
-    
-    earth_filter = term_m * term_f * K_inv
+    earth_filter = (term_m * term_f) / K_sq
     earth_filter[0, 0] = 0.0
     
     # Precompute RFFT of layers?
@@ -323,31 +440,6 @@ def forward_mag_tmi(
         out = torch.zeros((1, len(heights), x_idx.numel(), y_idx.numel()), device=device, dtype=torch.float32)
     else:
         out = torch.zeros((1, len(heights), x_idx.numel()), device=device, dtype=torch.float32)
-
-    # Scale factor from standard FFT definition on discrete grids.
-    # The continuous Fourier transform F(k) is related to discrete F[k] by dx*dy factor.
-    # i.e. Integral f(x) e^{-ikx} dx ~ Sum f(n) e^{-ikn} * dx
-    # So F_continuous ~ F_discrete * dx * dy.
-    # We need to multiply by dx * dy when moving to frequency domain to match physical units.
-    # Or multiply by dx*dy after IFFT?
-    # Actually, if we view it as convolution:
-    # f * g = IFFT( FFT(f) * FFT(g) ) ?
-    # In discrete: (f * g)[n] = sum f[k] g[n-k].
-    # In continuous: (f * g)(x) = int f(u) g(x-u) du ~ sum f(k) g(n-k) * dx.
-    # So we need one factor of cell area (dx*dy) for the convolution integral.
-    # Since our earth_filter is the continuous transfer function evaluated at discrete k,
-    # we effectively are doing: Result = IFFT( FFT(Model) * TransferFunction ).
-    # This corresponds to discrete convolution of Model with (IFFT(TransferFunction)).
-    # But the physical convolution integral needs a `dV` factor.
-    # Since we integrate over z analytically (giving the 1/k and exp factors), we are left with x,y integration.
-    # So we need a factor of (dx * dy).
-    
-    # Let's apply this scaling.
-    scale_xy = dx * dy
-    
-    # Combined scaling
-    scale *= scale_xy
-
     for hi, h in enumerate(heights):
         # Observation height h (meters above surface). 
         # Surface is z=0. Obs z = -h.
@@ -396,6 +488,7 @@ def forward_mag_tmi(
             out[0, hi] = val
 
     meta = {
+        "mode": "standard_B",
         "layout": layout,
         "obs_x_idx": x_idx.detach().cpu(),
         "obs_y_idx": y_idx.detach().cpu(),

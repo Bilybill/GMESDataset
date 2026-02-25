@@ -1,0 +1,26 @@
+# Same as config.yaml but defaults to prism_matched for reference runs.
+
+simulation:
+  device: cpu
+
+model:
+  shape: [64, 64, 32]
+  dx: 10.0
+  dy: 10.0
+  dz: 10.0
+
+magnetic:
+  mode: prism_matched
+  input_type: susceptibility
+  output_unit: nt
+  B0: 50000.0
+  inclination: 60.0
+  declination: 0.0
+  heights_m: [0.0]
+  pad_factor: 2
+
+observation:
+  layout: grid
+
+output:
+  save_path: output/magnetic_data_prism_matched.npz

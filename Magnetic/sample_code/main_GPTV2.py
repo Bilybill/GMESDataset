@@ -86,7 +86,7 @@ def main():
 
     # Run Forward
     t0 = time.time()
-    logger.info(f"Starting forward modeling (mode={mode})...")
+    logger.info("Starting forward modeling...")
     
     data, meta = forward_mag_tmi(
         susceptibility=model,

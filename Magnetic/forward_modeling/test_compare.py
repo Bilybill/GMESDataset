@@ -103,51 +103,73 @@ def compare_results():
     d_spatial = mat_spatial_prism_magnetic(nx, ny, nz, dx, dy, dz, h=0, model_slice=model)
     print(f"Spatial Calc Time: {time.time()-t0:.2f}s")
 
-    # 3. Run GPU FFT Forward (two modes)
-    # MATLAB sample uses M=1 (A/m) and a factor 10^2 = 100, so it is closer to "magnetization" mode.
-    # We still report both modes for clarity.
-    results = []
-    for input_type in ["magnetization", "susceptibility"]:
-        t0 = time.time()
-        tmi_gpu_t, _ = forward_mag_tmi(
-            torch.from_numpy(model).float(), dx, dy, dz,
-            heights_m=[0], obs_conf=obs_conf,
-            output_unit="nt"
-        )
-        tmi_gpu = tmi_gpu_t[0, 0].cpu().numpy()
-        elapsed = time.time() - t0
-        results.append((input_type, tmi_gpu, elapsed))
+    # 3. Run FFT Forward
+    # We compare against MATLAB-prism reference using magnetization mode (J in A/m).
+    # (This is consistent with MATLAB sample where model entries are set to 1 and then scaled by 100.)
 
-    print("\n--- Comparison Stats ---")
-    print(f"Spatial Max (MATLAB port): {d_spatial.max():.4f} nT")
-    
+    t0 = time.time()
+    tmi_prism_t, meta_prism = forward_mag_tmi(
+        torch.from_numpy(model).float(), dx, dy, dz,
+        heights_m=[0], obs_conf=obs_conf,
+        input_type="magnetization",
+        output_unit="nt",
+        mode="prism_matched",
+    )
+    tmi_prism = tmi_prism_t[0, 0].cpu().numpy()
+    t_prism = time.time() - t0
+
+    t0 = time.time()
+    tmi_std_t, meta_std = forward_mag_tmi(
+        torch.from_numpy(model).float(), dx, dy, dz,
+        heights_m=[0], obs_conf=obs_conf,
+        input_type="magnetization",
+        output_unit="nt",
+        mode="standard_B",
+        pad_factor=2,
+    )
+    tmi_std = tmi_std_t[0, 0].cpu().numpy()
+    t_std = time.time() - t0
+
+    print("\n--- Comparison Stats (vs MATLAB-prism spatial reference) ---")
+    print(f"Spatial (MATLAB port)  max: {d_spatial.max():.6f} nT")
+
     spa_n = _normalize(d_spatial)
-    for input_type, tmi_gpu, elapsed in results:
-        gpu_n = _normalize(tmi_gpu)
-        mae_normal = _mae(gpu_n, spa_n)
-        mae_flip_x = _mae(gpu_n[::-1, :], spa_n)
-        mae_flip_y = _mae(gpu_n[:, ::-1], spa_n)
-        mae_flip_xy = _mae(gpu_n[::-1, ::-1], spa_n)
-        ratio = d_spatial.max() / (tmi_gpu.max() + 1e-12)
-        
-        print(f"\n[Mode: {input_type}] GPU FFT time: {elapsed:.4f}s")
-        print(f"GPU FFT Max: {tmi_gpu.max():.4f} nT")
-        print(f"Ratio (Spatial/GPU): {ratio:.6f}")
-        print(f"MAE Normal: {mae_normal:.4f}")
-        print(f"MAE FlipX : {mae_flip_x:.4f}")
-        print(f"MAE FlipY : {mae_flip_y:.4f}")
-        print(f"MAE FlipXY: {mae_flip_xy:.4f}")
 
-    # Visualize (magnetization mode by default)
-    tmi_gpu = results[0][1]
-    gpu_n = _normalize(tmi_gpu)
-    diff_n = np.abs(gpu_n - spa_n)
-    plt.figure(figsize=(15,5))
-    plt.subplot(131); im1 = plt.imshow(results[0][1], cmap='jet', origin='lower'); plt.title("GPU FFT (magnetization)"); plt.colorbar(im1)
-    plt.subplot(132); im2 = plt.imshow(d_spatial, cmap='jet', origin='lower'); plt.title("MATLAB Port (spatial)"); plt.colorbar(im2)
-    plt.subplot(133); im3 = plt.imshow(diff_n, cmap='gray', origin='lower'); plt.title("Diff Norm"); plt.colorbar(im3)
-    plt.savefig("comparison_result.png")
-    print("Plot saved.")
+    def _report(name: str, arr: np.ndarray, elapsed: float):
+        arr_n = _normalize(arr)
+        mae_n = _mae(arr_n, spa_n)
+        # Also report absolute MAE in nT for intuition
+        mae_abs = _mae(arr, d_spatial)
+        ratio = d_spatial.max() / (arr.max() + 1e-12)
+        print(f"\n[{name}] time: {elapsed:.4f}s")
+        print(f"{name} max: {arr.max():.6f} nT")
+        print(f"Ratio (Spatial/{name}): {ratio:.6f}")
+        print(f"MAE (normalized): {mae_n:.6f}")
+        print(f"MAE (nT): {mae_abs:.6f}")
+
+    _report('prism_matched', tmi_prism, t_prism)
+    _report('standard_B',    tmi_std,   t_std)
+
+    # 4. Visualizations (Scheme 1)
+    # Plot 1: MATLAB prism vs prism_matched
+    diff_prism = np.abs(_normalize(tmi_prism) - spa_n)
+    plt.figure(figsize=(15, 5))
+    plt.subplot(131); im1 = plt.imshow(tmi_prism, cmap='jet', origin='lower'); plt.title('prism_matched (FFT)'); plt.colorbar(im1)
+    plt.subplot(132); im2 = plt.imshow(d_spatial, cmap='jet', origin='lower'); plt.title('MATLAB Port (spatial prism)'); plt.colorbar(im2)
+    plt.subplot(133); im3 = plt.imshow(diff_prism, cmap='gray', origin='lower'); plt.title('Diff Norm'); plt.colorbar(im3)
+    plt.tight_layout()
+    plt.savefig('comparison_prism_matched.png', dpi=200)
+
+    # Plot 2: MATLAB prism vs standard_B
+    diff_std = np.abs(_normalize(tmi_std) - spa_n)
+    plt.figure(figsize=(15, 5))
+    plt.subplot(131); im1 = plt.imshow(tmi_std, cmap='jet', origin='lower'); plt.title('standard_B (FFT)'); plt.colorbar(im1)
+    plt.subplot(132); im2 = plt.imshow(d_spatial, cmap='jet', origin='lower'); plt.title('MATLAB Port (spatial prism)'); plt.colorbar(im2)
+    plt.subplot(133); im3 = plt.imshow(diff_std, cmap='gray', origin='lower'); plt.title('Diff Norm'); plt.colorbar(im3)
+    plt.tight_layout()
+    plt.savefig('comparison_standard_B.png', dpi=200)
+
+    print("Plots saved: comparison_prism_matched.png, comparison_standard_B.png")
 
 if __name__ == "__main__":
     compare_results()
