@@ -171,5 +171,80 @@ def compare_results():
 
     print("Plots saved: comparison_prism_matched.png, comparison_standard_B.png")
 
+def compare_cpu_gpu_speed():
+    """
+    Compare execution speed between CPU and GPU for standard_B mode.
+    Scales up the model size for a more meaningful benchmark.
+    """
+    print("\n--- Speed Benchmark: CPU vs GPU (standard_B) ---")
+    
+    # Use a larger model for benchmarking relevance (e.g., 256^3)
+    # Or keep it moderate (e.g. 128x128x64) so it fits easily and runs quickly.
+    nx, ny, nz = 128, 128, 64
+    dx, dy, dz = 10.0, 10.0, 10.0
+    
+    print(f"Model size: {nx}x{ny}x{nz}")
+    
+    model_np = np.zeros((nx, ny, nz), dtype=np.float32)
+    # Add a block in the center
+    cx, cy, cz = nx//2, ny//2, nz//2
+    model_np[cx-10:cx+10, cy-10:cy+10, cz-5:cz+5] = 0.05
+    
+    obs_conf = {"layout": "grid", "n_x": nx, "n_y": ny}
+    
+    # 1. CPU Run
+    # Warmup
+    try:
+        t0 = time.time()
+        _ = forward_mag_tmi(
+            torch.from_numpy(model_np).float().to("cpu"), dx, dy, dz,
+            heights_m=[0], obs_conf=obs_conf, input_type="susceptibility",
+            mode="standard_B"
+        )
+        print(f"CPU Warmup finished.")
+    except Exception as e:
+        print(f"CPU Run failed: {e}")
+
+    # Meas
+    start_cpu = time.time()
+    _, _ = forward_mag_tmi(
+        torch.from_numpy(model_np).float().to("cpu"), dx, dy, dz,
+        heights_m=[0], obs_conf=obs_conf, input_type="susceptibility",
+        mode="standard_B"
+    )
+    t_cpu = time.time() - start_cpu
+    print(f"CPU Time: {t_cpu:.4f} s")
+    
+    # 2. GPU Run (if available)
+    if torch.cuda.is_available():
+        # Warmup
+        try:
+            _ = forward_mag_tmi(
+                torch.from_numpy(model_np).float().to("cuda"), dx, dy, dz,
+                heights_m=[0], obs_conf=obs_conf, input_type="susceptibility",
+                mode="standard_B"
+            )
+            torch.cuda.synchronize()
+            print(f"GPU Warmup finished.")
+            
+            # Meas
+            start_gpu = time.time()
+            _, _ = forward_mag_tmi(
+                torch.from_numpy(model_np).float().to("cuda"), dx, dy, dz,
+                heights_m=[0], obs_conf=obs_conf, input_type="susceptibility",
+                mode="standard_B"
+            )
+            torch.cuda.synchronize()
+            t_gpu = time.time() - start_gpu
+            print(f"GPU Time: {t_gpu:.4f} s")
+            print(f"Speedup (CPU/GPU): {t_cpu / t_gpu:.2f}x")
+            
+        except Exception as e:
+            print(f"GPU Run failed: {e}")
+    else:
+        print("CUDA not available, skipping GPU benchmark.")
+
+
 if __name__ == "__main__":
     compare_results()
+    compare_cpu_gpu_speed()
