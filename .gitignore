@@ -2,3 +2,7 @@ __pycache__
 *.__pycache__
 *.pyc
 *.png
+cache
+*.o
+build
+*.egg-info
