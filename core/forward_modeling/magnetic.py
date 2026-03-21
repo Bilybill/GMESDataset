@@ -1,0 +1,47 @@
+import torch
+from .base import BaseForwardSolver
+
+class MagneticForwardSolver(BaseForwardSolver):
+    """
+    Magnetic Forward Modeling Solver (Total Magnetic Intensity).
+    """
+    def __init__(self, dx, dy, dz, heights_m, obs_conf, inc, dec, inc0=None, dec0=None, B0=50000.0, output_unit="nt", pad_factor=2, input_type="susceptibility", algorithm="prism_matched"):
+        super().__init__()
+        self.dx = dx
+        self.dy = dy
+        self.dz = dz
+        self.heights_m = heights_m
+        self.obs_conf = obs_conf
+        self.inc = inc
+        self.dec = dec
+        self.inc0 = inc0 if inc0 is not None else inc
+        self.dec0 = dec0 if dec0 is not None else dec
+        self.B0 = B0
+        self.output_unit = output_unit
+        self.pad_factor = pad_factor
+        self.input_type = input_type
+        self.algorithm = algorithm
+
+    def forward(self, model: torch.Tensor):
+        """
+        Forward magnetic TMI.
+        Args:
+            model: 3D tensor of shape (nx, ny, nz) representing susceptibility or magnetization.
+        """
+        from Magnetic.forward_modeling.mag_forward import forward_mag_tmi
+        data, meta = forward_mag_tmi(
+            model,
+            self.dx, self.dy, self.dz,
+            self.heights_m,
+            self.obs_conf,
+            inc=self.inc,
+            dec=self.dec,
+            inc0=self.inc0,
+            dec0=self.dec0,
+            B0=self.B0,
+            output_unit=self.output_unit,
+            pad_factor=self.pad_factor,
+            input_type=self.input_type,
+            algorithm=self.algorithm
+        )
+        return data, meta

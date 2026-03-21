@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 from mt_forward import MTForward3D
 
 if __name__ == "__main__":
-    filepath = '/home/wangyh/Project/MTForward3D/MTModel/em_model_3d_50x30x50.bin'
+    filepath = '/home/wangyh/Project/GMESUni/MTForward3D/MTModel/em_model_3d_50x30x50.bin'
     
     NX, NY, NZ = 50, 30, 50
     dx, dy, dz = 160.0, 160.0, 80.0
-    f_min, f_max = 0.01, 100.0
+    f_min, f_max = 0.01, 1000.0
 
     print(f"Loading binary model from {filepath}")
     with open(filepath, 'rb') as f:
@@ -210,3 +210,7 @@ if __name__ == "__main__":
         print(f"Error plotting true model: {e}")
 
     print("All visualizations complete! Check the './cache/' directory for PNGs.")
+    # save data for 3D visualization
+    np.savetxt(os.path.join(save_folder, 'apparent_res_3d.txt'), app_res.reshape(len(freqs_np), NY, NX, 2).reshape(len(freqs_np), -1))
+    np.savetxt(os.path.join(save_folder, 'phase_3d.txt'), phase.reshape(len(freqs_np), NY, NX, 2).reshape(len(freqs_np), -1))
+    print(f"-> Saved 3D data for visualization: {os.path.join(save_folder, 'apparent_res_3d.txt')}, {os.path.join(save_folder, 'phase_3d.txt')}")

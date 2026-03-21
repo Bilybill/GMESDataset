@@ -6,6 +6,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <cuComplex.h>
 
 #include "include/mesh3d.h"
 #include "include/femAssemble3d.h"
@@ -78,6 +79,14 @@ std::vector<SurfaceField> computeSurfaceFields(const HostMesh3D& mesh, double fr
     }
     return fields;
 }
+
+extern "C" void gpu_femAssemble3D_Matrix(
+    int NE, int NX, int NY,
+    const double* d_hx, const double* d_hy, const double* d_hz,
+    const double* d_rho, double freq,
+    const int* d_ME_Edges,
+    const int* d_csrRowPtr, const int* d_csrColInd, 
+    cuDoubleComplex* d_csrVal, int nnz);
 
 std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor, double dx, double dy, double dz, std::vector<double> freqs) {
     TORCH_CHECK(rho_tensor.is_contiguous(), "rho_tensor must be contiguous");
@@ -167,6 +176,36 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
     std::vector<std::complex<double>> x_pol1(NDoF, {0.0, 0.0});
     std::vector<std::complex<double>> x_pol2(NDoF, {0.0, 0.0});
 
+    // 提前获取静态的 CSR 结构
+    std::vector<std::complex<double>> dummy_csrVal;
+    std::vector<int> h_csrColInd, h_csrRowPtr;
+    femAssemble3D_Matrix(mesh, 1.0, rho_pad, dummy_csrVal, h_csrColInd, h_csrRowPtr);
+    int nnz = dummy_csrVal.size();
+
+    // ==========================================
+    // 分配 GPU 长驻显存：坐标、拓扑与 CSR 结构
+    // ==========================================
+    double *d_hx, *d_hy, *d_hz, *d_rho;
+    int *d_ME_Edges, *d_csrRowPtr, *d_csrColInd;
+    cuDoubleComplex *d_csrVal;
+
+    cudaMalloc(&d_hx, mesh.NX * sizeof(double));
+    cudaMalloc(&d_hy, mesh.NY * sizeof(double));
+    cudaMalloc(&d_hz, mesh.NZ * sizeof(double));
+    cudaMalloc(&d_rho, mesh.NE * sizeof(double));
+    cudaMalloc(&d_ME_Edges, mesh.ME_Edges.size() * sizeof(int));
+    cudaMalloc(&d_csrRowPtr, h_csrRowPtr.size() * sizeof(int));
+    cudaMalloc(&d_csrColInd, h_csrColInd.size() * sizeof(int));
+    cudaMalloc(&d_csrVal, nnz * sizeof(cuDoubleComplex));
+
+    cudaMemcpy(d_hx, mesh.hx.data(), mesh.NX * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hy, mesh.hy.data(), mesh.NY * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hz, mesh.hz.data(), mesh.NZ * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rho, rho_pad.data(), mesh.NE * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ME_Edges, mesh.ME_Edges.data(), mesh.ME_Edges.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csrRowPtr, h_csrRowPtr.data(), h_csrRowPtr.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csrColInd, h_csrColInd.data(), h_csrColInd.size() * sizeof(int), cudaMemcpyHostToDevice);
+
     for (int ff = 0; ff < n_freqs; ff++) {
         double freq = freqs[ff];
         std::cout << "\n=== Processing Frequency " << ff + 1 << "/" << n_freqs << ": " << freq << " Hz ===" << std::endl;
@@ -174,9 +213,15 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
         double w = 2.0 * M_PI * freq;
         double mu = 4e-7 * M_PI;
 
-        std::vector<std::complex<double>> csrVal_base;
-        std::vector<int> csrColInd, csrRowPtr;
-        femAssemble3D_Matrix(mesh, freq, rho_pad, csrVal_base, csrColInd, csrRowPtr);
+        // 调用 GPU 组装
+        gpu_femAssemble3D_Matrix(mesh.NE, mesh.NX, mesh.NY, d_hx, d_hy, d_hz, d_rho, freq, d_ME_Edges, d_csrRowPtr, d_csrColInd, d_csrVal, nnz);
+        
+        std::vector<std::complex<double>> csrVal_base(nnz);
+        cudaMemcpy(csrVal_base.data(), d_csrVal, nnz * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+        
+        // 我们利用上面 CPU 版本算好的 h_csrColInd, h_csrRowPtr
+        std::vector<int>& csrColInd = h_csrColInd;
+        std::vector<int>& csrRowPtr = h_csrRowPtr;
         
         std::vector<std::complex<double>> csrVal_pol1 = csrVal_base; 
         std::vector<std::complex<double>> b_pol1(NDoF);
@@ -219,6 +264,15 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
             }
         }
     }
+
+    cudaFree(d_hx);
+    cudaFree(d_hy);
+    cudaFree(d_hz);
+    cudaFree(d_rho);
+    cudaFree(d_ME_Edges);
+    cudaFree(d_csrRowPtr);
+    cudaFree(d_csrColInd);
+    cudaFree(d_csrVal);
 
     return std::make_tuple(app_res, phase);
 }
