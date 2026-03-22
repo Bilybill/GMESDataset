@@ -245,9 +245,16 @@ class IgneousIntrusionParams:
     aureole_enable: bool = True
     aureole_thickness_m: float = 100.0
     aureole_vp_delta_frac: float = 0.03
+    aureole_rho_delta_frac: float = 0.02
+    aureole_resist_delta_frac: float = -0.1
+    aureole_chi_delta_frac: float = 0.05
     
     # Common
     vp_intr_mps: float = 5500.0
+    rho_intr_gcc: float = 3.0
+    resist_intr_ohmm: float = 5000.0
+    chi_intr_si: float = 0.05
+    
     roughness_amp_m: float = 5.0 # For backward compat
     roughness_scale: float = 0.02
     edge_width_m: float = 20.0
@@ -303,18 +310,22 @@ class IgneousIntrusion(Anomaly):
         return m > 0.5
         
     def soft_mask(self, X, Y, Z) -> np.ndarray:
-        _, m_core, _ = self._compute_full(np.zeros_like(Z), X, Y, Z, only_mask=True)
+        _, m_core, _ = self._compute_full({'temp': np.zeros_like(Z)}, X, Y, Z, only_mask=True)
         return m_core
 
     def apply_to_vp(self, vp: np.ndarray, X, Y, Z) -> np.ndarray:
-        vp_new, _, _ = self._compute_full(vp, X, Y, Z, only_mask=False)
-        return vp_new
+        props = self.apply_properties({'vp': vp}, X, Y, Z)
+        return props['vp']
+
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        props, *_ = self._compute_full(props_dict, X, Y, Z, only_mask=False)
+        return props
 
     # ----------------------------------------------------
     # Unified Logic
     # ----------------------------------------------------
     
-    def _compute_full(self, vp_bg: np.ndarray, X, Y, Z, only_mask: bool = False):
+    def _compute_full(self, props_bg: dict, X, Y, Z, only_mask: bool = False):
         p = self.params
         rng = self._rng
         nx, ny, nz = Z.shape
@@ -344,7 +355,7 @@ class IgneousIntrusion(Anomaly):
         elif p.kind == "stock":
              pre = self._precompute_stock(p, z_arr, rng)
              
-        vp_new = np.empty_like(vp_bg, dtype=np.float32) if not only_mask else None
+        props_new = {k: np.empty_like(v, dtype=np.float32) for k, v in props_bg.items()} if not only_mask else None
         m_core_vol = np.empty_like(Z, dtype=np.float32)
         # We assume regular per-slice processing
         
@@ -372,24 +383,41 @@ class IgneousIntrusion(Anomaly):
             m_core_vol[..., iz] = m_core
 
             if not only_mask:
-                vp_intr = float(p.vp_intr_mps)
-                # Apply core
-                # Note: original vp_bg is used
-                vp_slice = (1.0 - m_core) * vp_bg[..., iz] + m_core * vp_intr
-                
-                # Aureole
+                m_aur = 0.0
                 if p.aureole_enable and p.aureole_thickness_m > 0:
                      t_aur = float(p.aureole_thickness_m)
-                     # Ring: sdf <= 0 (outside core) and sdf >= -t_aur (inside aureole outer boundary)
-                     # Smooth selection
                      m_out = _sigmoid_stable(-sdf / wd)
                      m_near = _sigmoid_stable((sdf + t_aur) / wd)
                      m_aur = m_out * m_near
-                     vp_slice = vp_slice * (1.0 + float(p.aureole_vp_delta_frac) * m_aur)
-                     
-                vp_new[..., iz] = vp_slice
+                
+                for k, prop_bg in props_bg.items():
+                    prop_slice = prop_bg[..., iz].astype(np.float32)
+                    
+                    if k == 'vp':
+                        out_slice = (1.0 - m_core) * prop_slice + m_core * float(p.vp_intr_mps)
+                        if p.aureole_enable and abs(float(p.aureole_vp_delta_frac)) > 1e-9:
+                             out_slice *= (1.0 + float(p.aureole_vp_delta_frac) * m_aur)
+                    elif k == 'rho':
+                        out_slice = (1.0 - m_core) * prop_slice + m_core * float(p.rho_intr_gcc)
+                        if p.aureole_enable and abs(float(p.aureole_rho_delta_frac)) > 1e-9:
+                             out_slice *= (1.0 + float(p.aureole_rho_delta_frac) * m_aur)
+                    elif k == 'resist':
+                        log_bg = np.log10(np.clip(prop_slice, 1e-3, 1e6))
+                        log_intr = np.log10(p.resist_intr_ohmm)
+                        log_out = (1.0 - m_core) * log_bg + m_core * log_intr
+                        out_slice = 10.0 ** log_out
+                        if p.aureole_enable and abs(float(p.aureole_resist_delta_frac)) > 1e-9:
+                             out_slice *= (1.0 + float(p.aureole_resist_delta_frac) * m_aur)
+                    elif k == 'chi':
+                        out_slice = (1.0 - m_core) * prop_slice + m_core * float(p.chi_intr_si)
+                        if p.aureole_enable and abs(float(p.aureole_chi_delta_frac)) > 1e-9:
+                             out_slice *= (1.0 + float(p.aureole_chi_delta_frac) * m_aur)
+                    else:
+                        out_slice = prop_slice
+                        
+                    props_new[k][..., iz] = out_slice.astype(np.float32)
 
-        return vp_new, m_core_vol, None
+        return props_new, m_core_vol, None
 
 
     # ----------------------------------------------------

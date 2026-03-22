@@ -246,6 +246,13 @@ class SedimentBasementInterface(Anomaly):
         _, m_b, _ = self._compute_full(vp_bg=None, X=X, Y=Y, Z=Z, only_mask=True)
         return m_b
 
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        vp_bg = props_dict.get('vp')
+        if vp_bg is not None:
+            vp_new, _, _ = self._compute_full(vp_bg=vp_bg, X=X, Y=Y, Z=Z, only_mask=False)
+            props_dict['vp'] = vp_new
+        return props_dict
+
     def apply_to_vp(self, vp_bg: np.ndarray, X, Y, Z) -> np.ndarray:
         vp_new, _, _ = self._compute_full(vp_bg=vp_bg, X=X, Y=Y, Z=Z, only_mask=False)
         return vp_new

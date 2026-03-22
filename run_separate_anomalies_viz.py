@@ -28,50 +28,14 @@ def read_segy_volume(path):
     return vol, (dx, dy, dz)
 
 
-def add_titles_to_image(img_path, left_title, right_title):
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        import os
-        img = Image.open(img_path)
-        draw = ImageDraw.Draw(img)
-        w, h = img.size
-        
-        font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-        try:
-            font = ImageFont.truetype(font_path, 40)
-        except Exception:
-            font = ImageFont.load_default()
-            
-        left_bbox = draw.textbbox((0, 0), left_title, font=font)
-        right_bbox = draw.textbbox((0, 0), right_title, font=font)
-        
-        left_w = left_bbox[2] - left_bbox[0]
-        right_w = right_bbox[2] - right_bbox[0]
-        
-        # Grid is (1, 2), so w/4 is middle of left, 3w/4 is middle of right
-        left_pos = (w // 4 - left_w // 2, 30)
-        right_pos = (w * 3 // 4 - right_w // 2, 30)
-        
-        # Draw shadow
-        draw.text((left_pos[0]+2, left_pos[1]+2), left_title, font=font, fill='black')
-        draw.text((right_pos[0]+2, right_pos[1]+2), right_title, font=font, fill='black')
-        # Draw text
-        draw.text(left_pos, left_title, font=font, fill='white')
-        draw.text(right_pos, right_title, font=font, fill='white')
-        
-        img.save(img_path)
-    except Exception as e:
-        print(f"Warning: Failed to add title to {img_path}: {e}")
-
-
-def generate_and_plot(anomaly, name_en, name_zh, vp_bg, label_vol, dx, dy, dz):
+def generate_and_plot(anomaly, name_en, name_zh, vp_bg, label_vol, dx, dy, dz, run_app=False):
     builder = DatasetBuilder(dx, dy, dz)
     print(f"\n-> Generating {name_zh}...")
     
     # Inject individually
     vp_final, mask_final, X, Y, Z = builder.inject_anomalies(vp_bg, [anomaly])
     
-    save_dir = "/home/wangyh/Project/GMESUni/GMESDataset/DATAFOLDER/Cache"
+    save_dir = "/home/wangyh/Project/GMESUni/GMESDataset/DATAFOLDER/Cache/"
     os.makedirs(save_dir, exist_ok=True)
     
     nodes1 = cigvis.create_slices(vp_bg, cmap='jet')
@@ -137,23 +101,26 @@ def generate_and_plot(anomaly, name_en, name_zh, vp_bg, label_vol, dx, dy, dz):
                 nodes2.append(mask_nodes)
             
     # Draw two side-by-side canvases and save
-    out_file = f"Anomaly_{name_en}.png"
+    out_file = f"Anomaly_{name_en}-{name_zh}.png"
     out_path = os.path.join(save_dir, out_file)
-    cigvis.plot3D([nodes1, nodes2], grid=(1, 2), savename=out_file, savedir=save_dir, run_app=False)
-    
-    # Add Chinese titles via PIL
-    add_titles_to_image(out_path, "原始速度模型", name_zh)
+    cigvis.plot3D([nodes1, nodes2], grid=(1, 2), savename=out_file, savedir=save_dir, run_app=run_app, title=["原始速度模型", name_zh])
     
     print(f"Saved: {out_path}")
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_app", action="store_true", help="Launch cigvis GUI for checking visuals interactively.")
+    args = parser.parse_args()
+
     vp_segy_path = "/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Velocity_choas/braided/AYL-00000.sgy"
     label_segy_path = "/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Layer_choas/braided/AYL-00000.sgy"
     
     vp_bg, (dx, dy, dz) = read_segy_volume(vp_segy_path)
     label_vol, _ = read_segy_volume(label_segy_path)
     nx, ny, nz = vp_bg.shape
+    print(f'velocity shape = {nx,ny,nz}, dx={dx}, dy={dy}, dz={dz}')
 
     # 1. Dyke Swarm
     swarm_params = IgneousIntrusionParams(
@@ -162,14 +129,14 @@ def main():
         dyke_strike_deg=45.0, dyke_dip_deg=80.0, swarm_count=5, swarm_spacing_m=300.0,
         swarm_fan_deg=15.0, vp_intr_mps=5000.0, aureole_enable=True
     )
-    generate_and_plot(IgneousIntrusion(params=swarm_params, layer_labels=None, rng_seed=101), "Igneous_Swarm", "岩墙群", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(IgneousIntrusion(params=swarm_params, layer_labels=None, rng_seed=101), "Igneous_Swarm", "岩墙群", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 2. Stock (Plug)
     stock_params = IgneousIntrusionParams(
         kind="stock", stock_xc_m=2200.0, stock_yc_m=2200.0, stock_z_top_m=1500.0, stock_z_base_m=4500.0,
         stock_radius_m=400.0, vp_intr_mps=5800.0, aureole_enable=True
     )
-    generate_and_plot(IgneousIntrusion(params=stock_params, layer_labels=None, rng_seed=202), "Igneous_Stock", "岩株", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(IgneousIntrusion(params=stock_params, layer_labels=None, rng_seed=202), "Igneous_Stock", "岩株", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 3. Gas Reservoir
     gas_params = HydrocarbonHydrateParams(
@@ -177,7 +144,7 @@ def main():
         lens_extent_x_m=1200.0, lens_extent_y_m=700.0, lens_thickness_m=120.0, vp_gas_mps=1800.0,
         gas_enable_chimney=True, chimney_height_m=1200.0, rng_seed=11
     )
-    generate_and_plot(HydrocarbonHydrate(params=gas_params, layer_labels=label_vol), "Hydrocarbon_Gas", "气藏", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(HydrocarbonHydrate(params=gas_params, layer_labels=label_vol), "Hydrocarbon_Gas", "气藏", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 4. Gas Hydrate
     hyd_params = HydrocarbonHydrateParams(
@@ -185,35 +152,35 @@ def main():
         hydrate_offset_above_m=40.0, hydrate_thickness_m=70.0, vp_hydrate_mps=3800.0,
         hard_gate_to_layer=True, hydrate_enable_patchy=False, rng_seed=22
     )
-    generate_and_plot(HydrocarbonHydrate(params=hyd_params, layer_labels=label_vol), "Hydrocarbon_Hydrate", "天然气水合物", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(HydrocarbonHydrate(params=hyd_params, layer_labels=label_vol), "Hydrocarbon_Hydrate", "天然气水合物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 5. Brine Fault Zone
     brine_params = BrineFaultZoneParams(top_k=2, fault_quantile=0.996, core_thickness_m=40.0)
-    generate_and_plot(BrineFaultZone(params=brine_params, vp_ref=vp_bg, rng_seed=999), "Brine_Fault", "含卤水断层", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(BrineFaultZone(params=brine_params, vp_ref=vp_bg, rng_seed=999), "Brine_Fault", "含卤水断层", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 6. Sediment-Basement Interface
     sbi_params = SedimentBasementParams(
         use_layer_labels=True, basement_layer_id=-2, vp_basement_mps=6200.0, rng_seed=777
     )
-    generate_and_plot(SedimentBasementInterface(params=sbi_params, layer_labels=label_vol), "Sediment_Basement", "沉积基底界面", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(SedimentBasementInterface(params=sbi_params, layer_labels=label_vol), "Sediment_Basement", "沉积基底界面", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 7. Serpentinized Zone
     serp_params = SerpentinizedZoneParams(
         mode="patchy", use_layer_labels=True, corridor_length_m=2200.0, rng_seed=1212
     )
-    generate_and_plot(SerpentinizedZone(params=serp_params, layer_labels=label_vol), "Serpentinized_Zone", "蛇纹岩化带", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(SerpentinizedZone(params=serp_params, layer_labels=label_vol), "Serpentinized_Zone", "蛇纹岩化带", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 8. Massive Sulfide
     mass_sulfide_params = MassiveSulfideParams(
         layer_id=-1, center_x_m=1000.0, center_y_m=1000.0, lens_extent_x_m=600.0, lens_extent_y_m=500.0,
         lens_thickness_m=150.0
     )
-    generate_and_plot(MassiveSulfide(params=mass_sulfide_params, layer_labels=label_vol), "Massive_Sulfide", "块状硫化物", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(MassiveSulfide(params=mass_sulfide_params, layer_labels=label_vol), "Massive_Sulfide", "块状硫化物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
     # 9. Salt Dome
     salt_params = SaltDomeAnomaly.create_random_params((nx, ny, nz), (dx, dy, dz), seed=333)
     salt_dome = SaltDomeAnomaly(type="salt_dome", strength=0.0, edge_width_m=20.0, params=salt_params, rng_seed=333)
-    generate_and_plot(salt_dome, "Salt_Dome", "盐丘", vp_bg, label_vol, dx, dy, dz)
+    generate_and_plot(salt_dome, "Salt_Dome", "盐丘", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app)
 
 
 if __name__ == '__main__':

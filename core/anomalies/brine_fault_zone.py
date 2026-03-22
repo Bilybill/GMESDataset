@@ -137,46 +137,45 @@ class BrineFaultZone(Anomaly):
         return self._pre["subtype"].astype(np.int32)
 
     def apply_to_vp(self, vp_bg: np.ndarray, X, Y, Z) -> np.ndarray:
-        """
-        Optional tiny Vp decrease in fractured/fluid zones.
-        Default is no change (params vp_delta_frac_* = 0).
-        """
-        self._ensure_precomputed(X, Y, Z)
-        p = self.params
-        vp = vp_bg.astype(np.float32, copy=True)
-
-        if (p.vp_delta_frac_in_core == 0.0) and (p.vp_delta_frac_in_damage == 0.0):
-            return vp
-
-        m_core = self._pre["m_core_any"]
-        m_dmg = self._pre["m_dmg_any"]
-
-        if p.vp_delta_frac_in_damage != 0.0:
-            vp = vp * (1.0 + float(p.vp_delta_frac_in_damage) * m_dmg)
-        if p.vp_delta_frac_in_core != 0.0:
-            vp = vp * (1.0 + float(p.vp_delta_frac_in_core) * m_core)
-        return vp
+        props = self.apply_properties({'vp': vp_bg}, X, Y, Z)
+        return props['vp']
 
     def apply_to_resistivity(self, rho_bg: np.ndarray, X, Y, Z) -> np.ndarray:
+        props = self.apply_properties({'resist': rho_bg}, X, Y, Z)
+        return props['resist']
+
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
         """
-        Main usage: paint a low-resistivity brine corridor onto a resistivity model.
+        Unified property mapping: can apply to vp and resist simultaneously based on given dictionary keys.
         """
         self._ensure_precomputed(X, Y, Z)
         p = self.params
-
-        rho = rho_bg.astype(np.float32, copy=True)
-
-        # per-voxel background
-        rho_core = float(p.rho_core_ohmm)
-        rho_dmg = np.maximum(rho * float(p.rho_damage_factor), rho_core)
-
+        
         m_core = self._pre["m_core_any"]
         m_dmg = self._pre["m_dmg_any"]
-
-        # damage first, then core overwrite
-        rho = (1.0 - m_dmg) * rho + m_dmg * rho_dmg
-        rho = (1.0 - m_core) * rho + m_core * rho_core
-        return rho
+        
+        out_props = {}
+        
+        for k, v in props_dict.items():
+            vp = v.astype(np.float32, copy=True)
+            if k == 'vp':
+                if p.vp_delta_frac_in_damage != 0.0:
+                    vp = vp * (1.0 + float(p.vp_delta_frac_in_damage) * m_dmg)
+                if p.vp_delta_frac_in_core != 0.0:
+                    vp = vp * (1.0 + float(p.vp_delta_frac_in_core) * m_core)
+                out_props[k] = vp
+            elif k == 'resist':
+                # per-voxel background
+                rho_core_val = float(p.rho_core_ohmm)
+                rho_dmg = np.maximum(v * float(p.rho_damage_factor), rho_core_val)
+                # damage first, then core overwrite
+                vp = (1.0 - m_dmg) * v + m_dmg * rho_dmg
+                vp = (1.0 - m_core) * vp + m_core * rho_core_val
+                out_props[k] = vp
+            else:
+                out_props[k] = vp
+                
+        return out_props
 
     # --------- internal ----------
     def _ensure_precomputed(self, X, Y, Z):

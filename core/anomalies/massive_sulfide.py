@@ -297,11 +297,26 @@ class MassiveSulfideParams:
     halo_enable: bool = True
     halo_thickness_m: float = 160.0
 
-    # --- vp mapping (optional, can be replaced by your multi-physics mapping later) ---
+    # --- property mapping ---
     vp_massive_mps: float = 6200.0
     vp_chimney_mps: float = 5800.0
     vp_stockwork_mps: float = 5200.0
     halo_vp_delta_frac: float = -0.03  # negative can simulate fractured alteration lowering Vp
+    
+    rho_massive_gcc: float = 4.0
+    rho_chimney_gcc: float = 3.5
+    rho_stockwork_gcc: float = 3.0
+    halo_rho_delta_frac: float = -0.02
+    
+    resist_massive_ohmm: float = 0.5
+    resist_chimney_ohmm: float = 2.0
+    resist_stockwork_ohmm: float = 10.0
+    halo_resist_delta_frac: float = -0.2
+    
+    chi_massive_si: float = 0.05
+    chi_chimney_si: float = 0.02
+    chi_stockwork_si: float = 0.005
+    halo_chi_delta_frac: float = 0.0
 
     # --- smoothing / edges ---
     edge_width_m: float = 25.0
@@ -347,12 +362,19 @@ class MassiveSulfide(Anomaly):
         return (m > 0.5)
 
     def soft_mask(self, X, Y, Z) -> np.ndarray:
-        _, m_core, _ = self._compute_full(np.zeros_like(Z, dtype=np.float32), X, Y, Z, only_mask=True)
+        _, m_core, _ = self._compute_full({'temp': np.zeros_like(Z, dtype=np.float32)}, X, Y, Z, only_mask=True)
         return m_core
 
     def apply_to_vp(self, vp_bg: np.ndarray, X, Y, Z) -> np.ndarray:
-        vp_new, _, _ = self._compute_full(vp_bg, X, Y, Z, only_mask=False)
-        return vp_new
+        props = self.apply_properties({'vp': vp_bg}, X, Y, Z)
+        return props['vp']
+
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        """
+        Apply massive sulfide fields (vp, rho, resist, chi) based on parts (massive, chimney, stockwork, halo).
+        """
+        props, *_ = self._compute_full(props_dict, X, Y, Z, only_mask=False)
+        return props
 
     # ---------------------------
     # Optional extra label output
@@ -407,7 +429,7 @@ class MassiveSulfide(Anomaly):
     # Core computation
     # ------------------------------------------------------------------
 
-    def _compute_full(self, vp_bg: np.ndarray, X, Y, Z, only_mask: bool = False):
+    def _compute_full(self, props_bg: dict, X, Y, Z, only_mask: bool = False):
         p = self.params
         pre = self._get_precompute(X, Y, Z)
 
@@ -422,7 +444,7 @@ class MassiveSulfide(Anomaly):
         wd = max(float(self.edge_width_m), 1e-3)
 
         m_core_vol = np.empty((nx, ny, nz), dtype=np.float32)
-        vp_new = None if only_mask else np.empty_like(vp_bg, dtype=np.float32)
+        props_new = {k: np.empty_like(v, dtype=np.float32) for k, v in props_bg.items()} if not only_mask else None
 
         for iz in range(nz):
             z_m = float(z_arr[iz])
@@ -464,22 +486,44 @@ class MassiveSulfide(Anomaly):
 
             w_total = np.clip(w_massive + w_ch + w_sw, 0.0, 1.0)
 
-            vp_slice = vp_bg[..., iz].astype(np.float32)
-            vp_core = (
-                w_massive * float(p.vp_massive_mps) +
-                w_ch * float(p.vp_chimney_mps) +
-                w_sw * float(p.vp_stockwork_mps)
-            ).astype(np.float32)
+            for k, prop_bg in props_bg.items():
+                prop_slice = prop_bg[..., iz].astype(np.float32)
+                
+                # Default background mixing
+                if k == 'vp':
+                    prop_core = w_massive * float(p.vp_massive_mps) + w_ch * float(p.vp_chimney_mps) + w_sw * float(p.vp_stockwork_mps)
+                    out_slice = (1.0 - w_total) * prop_slice + prop_core
+                    if p.halo_enable and abs(float(p.halo_vp_delta_frac)) > 1e-9:
+                        out_slice *= (1.0 + float(p.halo_vp_delta_frac) * m_halo)
+                elif k == 'rho':
+                    prop_core = w_massive * float(p.rho_massive_gcc) + w_ch * float(p.rho_chimney_gcc) + w_sw * float(p.rho_stockwork_gcc)
+                    out_slice = (1.0 - w_total) * prop_slice + prop_core
+                    if p.halo_enable and abs(float(p.halo_rho_delta_frac)) > 1e-9:
+                        out_slice *= (1.0 + float(p.halo_rho_delta_frac) * m_halo)
+                elif k == 'chi':
+                    prop_core = w_massive * float(p.chi_massive_si) + w_ch * float(p.chi_chimney_si) + w_sw * float(p.chi_stockwork_si)
+                    out_slice = (1.0 - w_total) * prop_slice + prop_core
+                    if p.halo_enable and abs(float(p.halo_chi_delta_frac)) > 1e-9:
+                        out_slice *= (1.0 + float(p.halo_chi_delta_frac) * m_halo)
+                elif k == 'resist':
+                    # Use logarithmic/Archie-like mixing for conductivity (log(resist) blending)
+                    log_bg = np.log10(np.clip(prop_slice, 1e-3, 1e6))
+                    log_mass = np.log10(p.resist_massive_ohmm)
+                    log_ch = np.log10(p.resist_chimney_ohmm)
+                    log_sw = np.log10(p.resist_stockwork_ohmm)
+                    
+                    log_core = w_massive * log_mass + w_ch * log_ch + w_sw * log_sw
+                    log_out = (1.0 - w_total) * log_bg + log_core
+                    out_slice = 10.0 ** log_out
+                    
+                    if p.halo_enable and abs(float(p.halo_resist_delta_frac)) > 1e-9:
+                        out_slice *= (1.0 + float(p.halo_resist_delta_frac) * m_halo)
+                else:
+                    out_slice = prop_slice
+                
+                props_new[k][..., iz] = out_slice.astype(np.float32)
 
-            vp_mix = (1.0 - w_total) * vp_slice + vp_core
-
-            # halo vp adjustment (can be negative)
-            if p.halo_enable and abs(float(p.halo_vp_delta_frac)) > 1e-9:
-                vp_mix = vp_mix * (1.0 + float(p.halo_vp_delta_frac) * m_halo)
-
-            vp_new[..., iz] = vp_mix.astype(np.float32)
-
-        return vp_new, m_core_vol, None
+        return props_new, m_core_vol, None
 
     # ------------------------------------------------------------------
     # Precompute

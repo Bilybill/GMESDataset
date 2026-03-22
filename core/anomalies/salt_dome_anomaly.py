@@ -126,6 +126,11 @@ class SaltDomeParams:
     Ly: float = 2560.0
     Lz: float = 3200.0
 
+    # Multi-physics core properties
+    rho_salt_gcc: float = 2.15      # Typical low density for salt relative to compacted sediments
+    resist_salt_ohmm: float = 3000.0 # Highly resistive
+    chi_salt_si: float = -0.00001   # Diamagnetic (negative susceptibility)
+
 
 # --------------------------
 # Main anomaly class
@@ -216,109 +221,93 @@ class SaltDomeAnomaly(Anomaly):
     def soft_mask(self, X, Y, Z) -> np.ndarray:
         # We need to compute SDF.
         # This duplicates some work if apply_to_vp is also called, but that's okay for now.
-        _, mask_vol, _ = self._compute_full(np.zeros_like(Z, dtype=np.float32), X, Y, Z, only_mask=True)
+        _, mask_vol, _ = self._compute_full({'temp': np.zeros_like(Z, dtype=np.float32)}, X, Y, Z, only_mask=True)
         return mask_vol
 
     def apply_to_vp(self, vp_bg: np.ndarray, X, Y, Z) -> np.ndarray:
-        # Override to include warp
-        vp_new, _, _ = self._compute_full(vp_bg, X, Y, Z, only_mask=False)
-        return vp_new
+        # Backward compatibility
+        props = self.apply_properties({'vp': vp_bg}, X, Y, Z)
+        return props['vp']
+
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        """
+        Applies salt properties and tectonic warp to all given background properties.
+        """
+        return self._compute_full(props_dict, X, Y, Z, only_mask=False)
 
     # --- Internal computation logic ---
 
-
-    def _compute_full(self, vp_bg: np.ndarray, X, Y, Z, only_mask: bool = False):
+    def _compute_full(self, props_bg: dict, X, Y, Z, only_mask: bool = False):
         p = self.params
         rng = self._rng
         
-        # Deduce 1D coordinates
-        # Assuming X, Y, Z are meshgrids (indexing='ij')
-        # Check shapes (nx, ny, nz)
         nx, ny, nz = Z.shape
-        
-        # Unique z values
         x_arr = X[:, 0, 0].astype(np.float32)
         y_arr = Y[0, :, 0].astype(np.float32)
         z_arr = Z[0, 0, :].astype(np.float64)
-        
-        dz = z_arr[1] - z_arr[0] if len(z_arr) > 1 else 10.0 # fallback
+        dz = z_arr[1] - z_arr[0] if len(z_arr) > 1 else 10.0
 
-        # 1. Centerline
         cx, cy = self._centerline(p, z_arr, rng)
-        
-        # 2. Radius and Roughness
         R0 = self._radius_profile(p, z_arr)
         eps = self._roughness_profile(p, z_arr)
-        
-        # 3. Azimuth coeffs
         a_zk, phi_k, ks = self._azimuth_coeffs(p, z_arr, rng)
         
-        # 4. Warp amplitude
         A_z = p.warp_amp_m * np.exp(-((z_arr - p.warp_z_peak_m) ** 2) / max(p.warp_z_sigma_m ** 2, 1e-6))
         A_z[(z_arr < p.z_top_m) | (z_arr > p.z_base_m)] = 0.0
         A_z = A_z.astype(np.float32)
         
-        vp_new = np.empty_like(vp_bg, dtype=np.float32) if not only_mask else None
         mask_vol = np.empty_like(Z, dtype=np.float32)
+        props_new = {k: np.empty_like(v, dtype=np.float32) for k, v in props_bg.items()} if not only_mask else None
         
-        # Precompute indices
+        salt_vals = {
+            'vp': p.vp_salt_mps,
+            'rho': p.rho_salt_gcc,
+            'resist': p.resist_salt_ohmm,
+            'chi': p.chi_salt_si
+        }
+        
         xx, yy = np.indices((nx, ny), dtype=np.int32)
         
         for iz in range(nz):
             if R0[iz] <= 0.0:
                 mask_vol[..., iz] = 0.0
                 if not only_mask:
-                    vp_new[..., iz] = vp_bg[..., iz]
+                    for k in props_new:
+                        props_new[k][..., iz] = props_bg[k][..., iz]
                 continue
             
-            # 2D dx, dy to centerline
             dxv = (x_arr - cx[iz]).astype(np.float32)
             dyv = (y_arr - cy[iz]).astype(np.float32)
-            
-            # r and theta
-            # Use broadcasting: dxv is (nx,), dyv is (ny,)
-            # r shape (nx, ny)
             r = np.sqrt(dxv[:, None] ** 2 + dyv[None, :] ** 2).astype(np.float32) + 1e-6
             theta = np.arctan2(dyv[None, :], dxv[:, None]).astype(np.float32)
             
-            # Azimuth perturbation
             N = np.zeros_like(theta, dtype=np.float32)
             norm = 0.0
-            for i, k in enumerate(ks):
+            for i, k_azim in enumerate(ks):
                 a = a_zk[i, iz]
                 if a == 0.0: continue
-                N += a * np.cos(k * theta + phi_k[i]).astype(np.float32)
+                N += a * np.cos(k_azim * theta + phi_k[i]).astype(np.float32)
                 norm += abs(a)
             if norm > 1e-8:
                 N = N / norm
             else:
                 N[...] = 0.0
                 
-            # Radius
             R = R0[iz] * (1.0 + eps[iz] * N)
             R = np.clip(R, 0.25 * R0[iz], 10.0 * R0[iz]).astype(np.float32)
             
-            # SDF calculation
-            # Positive inside (r < R), Negative outside (r > R)
-            # This ensures m turns out close to 1 inside the salt and 0 outside
             sdf = (R - r).astype(np.float32)
-            
-            # Soft mask
             w = max(p.edge_width_m, 1e-3)
-            # manual sigmoid without helper for simplicity or use helper
-            # m = 1.0 / (1.0 + np.exp(sdf / w))
             m = _sigmoid_stable(sdf / w)
             mask_vol[..., iz] = m
             
             if only_mask:
                 continue
                 
-            # Warp
             Az_val = A_z[iz]
             if p.warp_enable and Az_val > 0.0:
                 sigma = max(p.warp_sigma_factor * R0[iz], 1e-3)
                 uz = (Az_val * np.exp(-(r ** 2) / (2.0 * sigma ** 2))).astype(np.float32)
-                # target index
                 zt = (iz + uz / dz).astype(np.float32)
                 z1 = np.floor(zt).astype(np.int32)
                 z2 = z1 + 1
@@ -326,23 +315,21 @@ class SaltDomeAnomaly(Anomaly):
                 z2 = np.clip(z2, 0, nz - 1)
                 wgt = (zt - z1).astype(np.float32)
                 
-                # Sample background
-                vp1 = vp_bg[xx, yy, z1]
-                vp2 = vp_bg[xx, yy, z2]
-                vp_warp = (1.0 - wgt) * vp1 + wgt * vp2
+                for k in props_new:
+                    vp1 = props_bg[k][xx, yy, z1]
+                    vp2 = props_bg[k][xx, yy, z2]
+                    prop_warp = (1.0 - wgt) * vp1 + wgt * vp2
+                    target_val = salt_vals.get(k, prop_warp) # Fallback to background if unknown property
+                    props_new[k][..., iz] = (1.0 - m) * prop_warp + m * target_val
             else:
-                vp_warp = vp_bg[..., iz]
-                
-            # Mix salt
-            # self.strength in Anomaly base class is typically relative perturbation
-            # But salt dome usually has fixed velocity.
-            # Base Anomaly.apply_to_vp does: vp * (1 + strength * mask)
-            # Here we want distinct salt velocity.
-            # We can use p.vp_salt_mps directly.
-            
-            vp_new[..., iz] = (1.0 - m) * vp_warp + m * p.vp_salt_mps
-            
-        return vp_new, mask_vol, None
+                for k in props_new:
+                    prop_bg = props_bg[k][..., iz]
+                    target_val = salt_vals.get(k, prop_bg)
+                    props_new[k][..., iz] = (1.0 - m) * prop_bg + m * target_val
+                    
+        if only_mask:
+            return None, mask_vol, None
+        return props_new
 
 
     def _centerline(self, p: SaltDomeParams, z: np.ndarray, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:

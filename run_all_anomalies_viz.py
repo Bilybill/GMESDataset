@@ -1,4 +1,6 @@
 import os
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+import os
 import sys
 import numpy as np
 import segyio

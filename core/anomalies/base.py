@@ -19,3 +19,14 @@ class Anomaly:
     def apply_to_vp(self, vp: np.ndarray, X, Y, Z) -> np.ndarray:
         m = self.soft_mask(X, Y, Z)
         return vp * (1.0 + self.strength * m)
+
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        """
+        Apply anomaly properties to a dictionary of 3D property grids.
+        props_dict: dict with keys like 'vp', 'rho', 'resist', 'chi', etc.
+        Returns: Updated props_dict.
+        """
+        out_dict = dict(props_dict)
+        if 'vp' in props_dict:
+            out_dict['vp'] = self.apply_to_vp(props_dict['vp'], X, Y, Z)
+        return out_dict

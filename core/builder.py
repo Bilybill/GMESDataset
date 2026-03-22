@@ -18,27 +18,35 @@ class DatasetBuilder:
         X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
         return X, Y, Z
 
-    def inject_anomalies(self, vp_bg: np.ndarray, anomalies: list[Anomaly]):
+    def inject_properties(self, props_bg: dict, anomalies: list[Anomaly]):
         """
-        Inject anomalies into the background Vp model.
+        Inject anomalies into a multiphysics dictionary of background models.
+        props_bg: dict like {'vp': vp_array, 'rho': rho_array, ...}
         Returns:
-            vp: The perturbed velocity model.
+            props: The updated property dictionaries.
             label: The anomaly label mask (0 for background).
             X, Y, Z: The coordinate grids used.
         """
-        X, Y, Z = self.make_grid(vp_bg.shape)
-        vp = vp_bg.copy()
-        label = np.zeros_like(vp_bg, dtype=np.int16)  # 0=background
+        # Assume all properties have the same shape, use one to get axes
+        sample_key = list(props_bg.keys())[0]
+        X, Y, Z = self.make_grid(props_bg[sample_key].shape)
+        
+        props_new = {k: v.copy() for k, v in props_bg.items()}
+        label = np.zeros_like(props_bg[sample_key], dtype=np.int16)
         
         for k, anom in enumerate(anomalies, start=1):
             m = anom.soft_mask(X, Y, Z)
-            # Apply perturbation
-            # vp = vp * (1.0 + anom.strength * m)
-            vp = anom.apply_to_vp(vp, X, Y, Z)
             
-            # Update label
-            # If overlap, this simple logic overwrites with the latest anomaly
-            # Use 0.5 threshold for soft mask to define label boundary
+            # Apply all multiphysics logic simultaneously
+            props_new = anom.apply_properties(props_new, X, Y, Z)
+            
             label[m > 0.5] = k
             
-        return vp, label, X, Y, Z
+        return props_new, label, X, Y, Z
+
+    def inject_anomalies(self, vp_bg: np.ndarray, anomalies: list[Anomaly]):
+        """
+        Backward compatible wrapper for injecting only into a Vp background model.
+        """
+        props, label, X, Y, Z = self.inject_properties({'vp': vp_bg}, anomalies)
+        return props['vp'], label, X, Y, Z

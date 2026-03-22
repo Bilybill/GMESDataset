@@ -474,6 +474,7 @@ class SerpentinizedZoneParams:
     vp_delta_frac: float = -0.25      # multiply background Vp by (1 + delta) inside core
     rho_delta_frac: float = -0.12     # density decrease
     chi_add_SI: float = 0.02          # susceptibility increase (absolute add)
+    resist_delta_frac: float = -0.3   # resistivity decrease due to secondary minerals/fluids
 
     # Background property defaults for build_property_models (if not provided)
     rho_bg_gcc: float = 2.70
@@ -516,6 +517,37 @@ class SerpentinizedZone(Anomaly):
     def apply_to_vp(self, vp: np.ndarray, X, Y, Z) -> np.ndarray:
         vp_new, _, _ = self._compute_full(vp_bg=vp, X=X, Y=Y, Z=Z, only_mask=False)
         return vp_new
+
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        """
+        Unified property interface applying serpentinization effects on vp, rho, chi, and resist.
+        """
+        out_props = {}
+        
+        # Determine masks
+        res = self._compute_full(vp_bg=props_dict.get('vp'), X=X, Y=Y, Z=Z, only_mask=(not 'vp' in props_dict), need_halo=True)
+        if len(res) == 4:
+            vp_new, m_core, m_halo, alt_degree = res
+        else:
+            vp_new, m_core, m_halo = res
+            alt_degree = m_core
+
+        p = self.params
+        
+        for k, v in props_dict.items():
+            if k == 'vp':
+                out_props[k] = vp_new if vp_new is not None else v * (1.0 + float(p.vp_delta_frac) * alt_degree)
+            elif k == 'rho':
+                out_props[k] = v * (1.0 + float(getattr(p, 'rho_delta_frac', -0.12)) * alt_degree)
+            elif k == 'chi':
+                out_props[k] = v + float(getattr(p, 'chi_add_SI', 0.02)) * alt_degree
+            elif k == 'resist':
+                # Optional: resistivity typically decreases in serpentinized rocks
+                out_props[k] = v * (1.0 + float(getattr(p, 'resist_delta_frac', -0.3)) * alt_degree)
+            else:
+                out_props[k] = v.copy()
+                
+        return out_props
 
     def build_property_models(
         self,

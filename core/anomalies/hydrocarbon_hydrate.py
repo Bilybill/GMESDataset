@@ -263,15 +263,27 @@ class HydrocarbonHydrateParams:
     free_gas_offset_below_m: float = 60.0
     free_gas_thickness_m: float = 90.0
 
-    # vp targets (you can later extend to rho/resistivity using masks)
+    # vp targets
     vp_gas_mps: float = 1800.0
     vp_hydrate_mps: float = 3700.0
     vp_free_gas_mps: float = 2000.0
+    
+    # rho targets (g/cc)
+    rho_gas_gcc: float = 2.0
+    rho_hydrate_gcc: float = 2.3
+    rho_free_gas_gcc: float = 2.1
+    
+    # resist targets (Ohm-m)
+    resist_gas_ohmm: float = 100.0
+    resist_hydrate_ohmm: float = 200.0
+    resist_free_gas_ohmm: float = 50.0
 
     # halo (optional): represent resistivity high ring / altered zone etc.
     halo_enable: bool = True
     halo_thickness_m: float = 120.0
     halo_vp_delta_frac: float = 0.01  # small perturb on background
+    halo_rho_delta_frac: float = 0.01
+    halo_resist_delta_frac: float = 0.1
 
     # soft edge
     edge_width_m: float = 20.0
@@ -306,12 +318,19 @@ class HydrocarbonHydrate(Anomaly):
         return self.soft_mask(X, Y, Z) > 0.5
 
     def soft_mask(self, X, Y, Z) -> np.ndarray:
-        _, m_all, _ = self._compute_full(np.zeros_like(Z, dtype=np.float32), X, Y, Z, only_mask=True)
+        _, m_all, _ = self._compute_full({'temp': np.zeros_like(Z, dtype=np.float32)}, X, Y, Z, only_mask=True)
         return m_all
 
     def apply_to_vp(self, vp: np.ndarray, X, Y, Z) -> np.ndarray:
-        vp_new, _, _ = self._compute_full(vp, X, Y, Z, only_mask=False)
-        return vp_new
+        props = self.apply_properties({'vp': vp}, X, Y, Z)
+        return props['vp']
+
+    def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        """
+        Unified property application for hydrocarbon hydrate system.
+        """
+        props, *_ = self._compute_full(props_dict, X, Y, Z, only_mask=False)
+        return props
 
     # ---- extra utilities ----
     def subtype_labels(self, X, Y, Z) -> np.ndarray:
@@ -402,7 +421,7 @@ class HydrocarbonHydrate(Anomaly):
     # core computation
     # ----------------------------
 
-    def _compute_full(self, vp_bg: np.ndarray, X, Y, Z, only_mask: bool = False):
+    def _compute_full(self, props_bg: dict, X, Y, Z, only_mask: bool = False):
         p = self.params
         pre = self._precompute(X, Y, Z)
         nx, ny, nz = Z.shape
@@ -411,7 +430,7 @@ class HydrocarbonHydrate(Anomaly):
         wd = max(float(p.edge_width_m), 1e-3)
 
         m_all_vol = np.zeros((nx, ny, nz), dtype=np.float32)
-        vp_new = None if only_mask else np.empty_like(vp_bg, dtype=np.float32)
+        props_new = {k: np.empty_like(v, dtype=np.float32) for k, v in props_bg.items()} if not only_mask else None
 
         for iz in range(nz):
             z = float(z_arr[iz])
@@ -421,40 +440,71 @@ class HydrocarbonHydrate(Anomaly):
             m_all_vol[..., iz] = m_all
 
             if not only_mask:
-                # default: keep background
-                vp_slice = vp_bg[..., iz].astype(np.float32, copy=False)
-
-                # component-wise inject (priority order matters)
                 sdf_lens, sdf_chim, sdf_hyd, sdf_fg = self._sdf_components_slice(X2d, Y2d, z, iz, pre)
 
                 if p.kind == "gas":
                     m_lens = _sigmoid_stable(sdf_lens / wd) if sdf_lens is not None else 0.0
                     m_chim = _sigmoid_stable(sdf_chim / wd) if sdf_chim is not None else 0.0
                     m_gas = np.maximum(m_lens, m_chim).astype(np.float32)
-                    vp_slice = (1.0 - m_gas) * vp_slice + m_gas * float(p.vp_gas_mps)
-
+                    m_hyd = 0.0
+                    m_fg = 0.0
                 else:  # hydrate
                     m_hyd = _sigmoid_stable(sdf_hyd / wd) if sdf_hyd is not None else 0.0
-                    vp_slice = (1.0 - m_hyd) * vp_slice + m_hyd * float(p.vp_hydrate_mps)
-
+                    m_gas = 0.0
                     if p.hydrate_enable_free_gas_below and (sdf_fg is not None):
                         m_fg = _sigmoid_stable(sdf_fg / wd)
-                        # free gas below may overlap hydrate at faults -> let hydrate dominate
                         m_fg = (m_fg * (1.0 - m_hyd)).astype(np.float32)
-                        vp_slice = (1.0 - m_fg) * vp_slice + m_fg * float(p.vp_free_gas_mps)
+                    else:
+                        m_fg = 0.0
 
-                # halo: small fractional perturbation on background (NOT overriding core)
+                m_halo = 0.0
                 if p.halo_enable and p.halo_thickness_m > 0:
                     t = float(p.halo_thickness_m)
-                    # halo ring outside core: sdf<=0 and sdf>=-t
                     m_out = _sigmoid_stable(-sdf_union / wd)
                     m_near = _sigmoid_stable((sdf_union + t) / wd)
                     m_halo = (m_out * m_near).astype(np.float32)
-                    vp_slice = vp_slice * (1.0 + float(p.halo_vp_delta_frac) * m_halo)
 
-                vp_new[..., iz] = vp_slice
+                for k, prop_bg in props_bg.items():
+                    prop_slice = prop_bg[..., iz].astype(np.float32, copy=False)
 
-        return vp_new, m_all_vol, None
+                    if k == 'vp':
+                        if p.kind == "gas":
+                            prop_slice = (1.0 - m_gas) * prop_slice + m_gas * float(p.vp_gas_mps)
+                        else:
+                            prop_slice = (1.0 - m_hyd) * prop_slice + m_hyd * float(p.vp_hydrate_mps)
+                            if m_fg is not float and np.any(m_fg > 0):
+                                prop_slice = (1.0 - m_fg) * prop_slice + m_fg * float(p.vp_free_gas_mps)
+                        if p.halo_enable and abs(float(p.halo_vp_delta_frac)) > 1e-9:
+                            prop_slice = prop_slice * (1.0 + float(p.halo_vp_delta_frac) * m_halo)
+                    
+                    elif k == 'rho':
+                        if p.kind == "gas":
+                            prop_slice = (1.0 - m_gas) * prop_slice + m_gas * float(p.rho_gas_gcc)
+                        else:
+                            prop_slice = (1.0 - m_hyd) * prop_slice + m_hyd * float(p.rho_hydrate_gcc)
+                            if m_fg is not float and np.any(m_fg > 0):
+                                prop_slice = (1.0 - m_fg) * prop_slice + m_fg * float(p.rho_free_gas_gcc)
+                        if p.halo_enable and abs(float(getattr(p, 'halo_rho_delta_frac', 0.0))) > 1e-9:
+                            prop_slice = prop_slice * (1.0 + float(p.halo_rho_delta_frac) * m_halo)
+                            
+                    elif k == 'resist':
+                        log_bg = np.log10(np.clip(prop_slice, 1e-3, 1e6))
+                        if p.kind == "gas":
+                            log_gas = np.log10(p.resist_gas_ohmm)
+                            log_out = (1.0 - m_gas) * log_bg + m_gas * log_gas
+                        else:
+                            log_hyd = np.log10(p.resist_hydrate_ohmm)
+                            log_out = (1.0 - m_hyd) * log_bg + m_hyd * log_hyd
+                            if m_fg is not float and np.any(m_fg > 0):
+                                log_fg = np.log10(p.resist_free_gas_ohmm)
+                                log_out = (1.0 - m_fg) * log_out + m_fg * log_fg
+                        prop_slice = 10.0 ** log_out
+                        if p.halo_enable and abs(float(getattr(p, 'halo_resist_delta_frac', 0.0))) > 1e-9:
+                            prop_slice = prop_slice * (1.0 + float(p.halo_resist_delta_frac) * m_halo)
+                            
+                    props_new[k][..., iz] = prop_slice
+                    
+        return props_new, m_all_vol, None
 
 
     def _precompute(self, X, Y, Z) -> Dict[str, Any]:
