@@ -5,7 +5,7 @@ class GravityForwardSolver(BaseForwardSolver):
     """
     Gravity Forward Modeling Solver (vertical component gz).
     """
-    def __init__(self, dx, dy, dz, heights_m, obs_conf, G=6.67430e-11, output_unit="mgal", pad_factor=2, density_unit="kg/m3"):
+    def __init__(self, dx, dy, dz, heights_m, obs_conf, G=6.67430e-11, output_unit="mgal", pad_factor=2, density_unit="kg/m^3"):
         super().__init__()
         self.dx = dx
         self.dy = dy
@@ -21,7 +21,7 @@ class GravityForwardSolver(BaseForwardSolver):
         """
         Forward gravity gz.
         Args:
-            density: 3D contiguous tensor of shape (nx, ny, nz)
+            density: 3D contiguous tensor of shape (nx, ny, nz) in kg/m^3.
         """
         from Gravity.forward_modeling.gra_forward import forward_gravity_gz
         # The gra_forward expects density, dx, dy, dz

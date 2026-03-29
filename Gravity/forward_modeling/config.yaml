@@ -5,6 +5,7 @@ simulation:
 model:
   # Density model path (relative paths are resolved relative to this config file)
   file_path: ../sample_code/density.npy    # <-- replace with your density model
+  density_unit: kg/m^3                     # canonical gravity density unit
   shape: [256, 256, 256]                  # required for .bin or if file_path missing
   dx: 10.0
   dy: 10.0

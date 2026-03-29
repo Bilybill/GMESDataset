@@ -29,7 +29,7 @@ Outputs
 - apply_to_vp(vp_bg, X, Y, Z): returns vp with basement enforced (mode configurable)
 - soft_mask(X,Y,Z): basement soft mask (0..1)
 - build_property_models(X,Y,Z, vp_bg=None): returns dict with
-    rho_gcc, resist_ohmm, chi_SI, facies_label (1 sediment / 2 basement / 3 interface band),
+    rho / rho_kgm3, resist_ohmm, chi_SI, facies_label (1 sediment / 2 basement / 3 interface band),
     z_interface_xy (nx,ny)
 
 Integration
@@ -192,7 +192,7 @@ class SedimentBasementParams:
     vp_sed_scale_m: float = 1600.0
     vp_sed_lateral_frac: float = 0.03  # small lateral variations (fraction)
 
-    # Density (g/cc)
+    # Density params are kept in g/cc for backward compatibility and converted to kg/m^3 in outputs.
     rho_sed0_gcc: float = 1.95
     rho_sed_inf_gcc: float = 2.45
     rho_sed_scale_m: float = 2200.0
@@ -265,7 +265,7 @@ class SedimentBasementInterface(Anomaly):
     ) -> Dict[str, np.ndarray]:
         """
         Returns:
-          rho_gcc, resist_ohmm, chi_SI, facies_label, z_interface_xy
+                    rho, rho_kgm3, resist_ohmm, chi_SI, facies_label, z_interface_xy
         If vp_bg is provided, Vp model will be produced with apply_mode and used as reference,
         otherwise properties follow the param trends.
         """
@@ -304,7 +304,7 @@ class SedimentBasementInterface(Anomaly):
             vp_ref = None
 
         # property volumes
-        rho = np.empty((nx, ny, nz), dtype=np.float32)
+        rho_gcc = np.empty((nx, ny, nz), dtype=np.float32)
         resist = np.empty((nx, ny, nz), dtype=np.float32)
         chi = np.empty((nx, ny, nz), dtype=np.float32)
 
@@ -355,12 +355,16 @@ class SedimentBasementInterface(Anomaly):
 
             # blend with basement mask
             mb = m_b[..., iz]
-            rho[..., iz] = (1.0 - mb) * rho_sed_map + mb * rho_base
+            rho_gcc[..., iz] = (1.0 - mb) * rho_sed_map + mb * rho_base
             resist[..., iz] = (1.0 - mb) * resist_sed + mb * resist_base
             chi[..., iz] = (1.0 - mb) * chi_sed + mb * chi_base
 
+        rho_kgm3 = rho_gcc * 1000.0
+
         return {
-            "rho_gcc": rho,
+            "rho": rho_kgm3,
+            "rho_kgm3": rho_kgm3,
+            "rho_gcc": rho_gcc,
             "resist_ohmm": resist,
             "chi_SI": chi,
             "facies_label": facies,

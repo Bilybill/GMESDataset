@@ -253,13 +253,13 @@ def main():
     # Note: build_property_models needs X,Y,Z. 
     # Since builder only updates Vp, we verify properties separately here.
     multi_props = sbi.build_property_models(X, Y, Z, vp_bg=vp_bg)
-    rho_sbi = multi_props["rho_gcc"]
+    rho_sbi = multi_props["rho_kgm3"]
     res_sbi = multi_props["resist_ohmm"]
     chi_sbi = multi_props["chi_SI"]
     facies_sbi = multi_props["facies_label"]
 
     print(f"   SBI Properties Generated:")
-    print(f"     Rho range: {rho_sbi.min():.2f} - {rho_sbi.max():.2f} g/cc")
+    print(f"     Rho range: {rho_sbi.min():.2f} - {rho_sbi.max():.2f} kg/m^3")
     print(f"     Res range: {res_sbi.min():.2f} - {res_sbi.max():.2f} Ohm.m")
     print(f"     Chi range: {chi_sbi.min():.4f} - {chi_sbi.max():.4f} SI")
 

@@ -34,14 +34,14 @@ class MagneticForwardSolver(BaseForwardSolver):
             self.dx, self.dy, self.dz,
             self.heights_m,
             self.obs_conf,
-            inc=self.inc,
-            dec=self.dec,
-            inc0=self.inc0,
-            dec0=self.dec0,
+            input_type=self.input_type,
             B0=self.B0,
+            I_deg=self.inc,
+            A_deg=self.dec,
+            M_I_deg=self.inc0,
+            M_A_deg=self.dec0,
             output_unit=self.output_unit,
             pad_factor=self.pad_factor,
-            input_type=self.input_type,
-            algorithm=self.algorithm
+            mode=self.algorithm
         )
         return data, meta

@@ -268,7 +268,7 @@ class HydrocarbonHydrateParams:
     vp_hydrate_mps: float = 3700.0
     vp_free_gas_mps: float = 2000.0
     
-    # rho targets (g/cc)
+    # rho target params (legacy g/cc values converted to kg/m^3 for rho grids)
     rho_gas_gcc: float = 2.0
     rho_hydrate_gcc: float = 2.3
     rho_free_gas_gcc: float = 2.1
@@ -478,12 +478,13 @@ class HydrocarbonHydrate(Anomaly):
                             prop_slice = prop_slice * (1.0 + float(p.halo_vp_delta_frac) * m_halo)
                     
                     elif k == 'rho':
+                        # Canonical rho grids use kg/m^3; params stay in g/cc for config compatibility.
                         if p.kind == "gas":
-                            prop_slice = (1.0 - m_gas) * prop_slice + m_gas * float(p.rho_gas_gcc)
+                            prop_slice = (1.0 - m_gas) * prop_slice + m_gas * (1000.0 * float(p.rho_gas_gcc))
                         else:
-                            prop_slice = (1.0 - m_hyd) * prop_slice + m_hyd * float(p.rho_hydrate_gcc)
+                            prop_slice = (1.0 - m_hyd) * prop_slice + m_hyd * (1000.0 * float(p.rho_hydrate_gcc))
                             if m_fg is not float and np.any(m_fg > 0):
-                                prop_slice = (1.0 - m_fg) * prop_slice + m_fg * float(p.rho_free_gas_gcc)
+                                prop_slice = (1.0 - m_fg) * prop_slice + m_fg * (1000.0 * float(p.rho_free_gas_gcc))
                         if p.halo_enable and abs(float(getattr(p, 'halo_rho_delta_frac', 0.0))) > 1e-9:
                             prop_slice = prop_slice * (1.0 + float(p.halo_rho_delta_frac) * m_halo)
                             

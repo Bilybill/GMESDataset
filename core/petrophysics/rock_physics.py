@@ -1,218 +1,398 @@
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
+
 class PetrophysicsConverter:
-    """
-    面向深度学习预训练的多物理场随机岩石物理转换引擎。
-    采用空间相关的3D高斯随机场算法，确保生成的参数分布具有真实的“斑块状”地质非均质性，避免纯白噪声带来的非物理跳变。
-    """
-    def __init__(self):
-        # 初始化时不固定参数，而是在调用时动态生成
-        pass
+    FACIES_SHALE = 0
+    FACIES_SANDSTONE = 1
+    FACIES_CARBONATE = 2
+
+    FACIES_NAMES = {
+        FACIES_SHALE: "shale",
+        FACIES_SANDSTONE: "sandstone",
+        FACIES_CARBONATE: "carbonate",
+    }
+
+    FACIES_PARAMS = {
+        FACIES_SHALE: {
+            "density_a": 255.0,
+            "density_b": 0.275,
+            "density_clip": (1950.0, 2900.0),
+            "vm": 3950.0,
+            "vf": 1500.0,
+            "phi0": 0.18,
+            "phi_min": 0.04,
+            "phi_max": 0.22,
+            "compaction": 2.8,
+            "phi_blend": 0.30,
+            "rw_surface": 0.28,
+            "rw_deep": 0.12,
+            "archie_a": 1.15,
+            "archie_m": 1.95,
+            "archie_n": 1.85,
+            "clay_base": 0.55,
+            "clay_span": 0.30,
+            "clay_res_base": 4.5,
+            "res_clip": (0.2, 300.0),
+            "chi_mean": 8.0e-5,
+            "chi_span": 5.0e-5,
+        },
+        FACIES_SANDSTONE: {
+            "density_a": 292.0,
+            "density_b": 0.255,
+            "density_clip": (2050.0, 2850.0),
+            "vm": 5400.0,
+            "vf": 1500.0,
+            "phi0": 0.30,
+            "phi_min": 0.03,
+            "phi_max": 0.34,
+            "compaction": 3.5,
+            "phi_blend": 0.60,
+            "rw_surface": 0.24,
+            "rw_deep": 0.09,
+            "archie_a": 1.0,
+            "archie_m": 1.90,
+            "archie_n": 1.85,
+            "clay_base": 0.06,
+            "clay_span": 0.16,
+            "clay_res_base": 7.0,
+            "res_clip": (2.0, 2000.0),
+            "chi_mean": 2.5e-5,
+            "chi_span": 1.5e-5,
+        },
+        FACIES_CARBONATE: {
+            "density_a": 308.0,
+            "density_b": 0.248,
+            "density_clip": (2200.0, 3000.0),
+            "vm": 6400.0,
+            "vf": 1500.0,
+            "phi0": 0.12,
+            "phi_min": 0.01,
+            "phi_max": 0.18,
+            "compaction": 4.6,
+            "phi_blend": 0.55,
+            "rw_surface": 0.30,
+            "rw_deep": 0.12,
+            "archie_a": 0.95,
+            "archie_m": 2.20,
+            "archie_n": 2.0,
+            "clay_base": 0.01,
+            "clay_span": 0.05,
+            "clay_res_base": 15.0,
+            "res_clip": (20.0, 5000.0),
+            "chi_mean": 8.0e-6,
+            "chi_span": 8.0e-6,
+        },
+    }
+
+    def __init__(self, random_seed=7):
+        self.rng = np.random.default_rng(random_seed)
+        self._background_state = None
+        self.last_background_qc = None
 
     def _generate_correlated_noise(self, shape, sigma=3.0):
-        """
-        生成具有空间相关性的 3D 噪声，避免纯白噪声导致的非物理跳变。
-        """
-        noise = np.random.normal(0, 1, shape)
+        noise = self.rng.normal(0.0, 1.0, shape)
         filtered_noise = gaussian_filter(noise, sigma=sigma)
-        # 归一化到近似 N(0, 1) 的正态分布，保证乘性或加性系数容易控制
         std_val = np.std(filtered_noise)
         if std_val > 1e-8:
             filtered_noise = filtered_noise / std_val
-        return filtered_noise
+        return filtered_noise.astype(np.float32)
 
-    def generate_background(self, vp_model, label_vol=None):
-        """
-        根据 Vp 模型生成具有动态参数及空间相干分布特征的背景多物理场。
-        如果提供 label_vol，将依据地层标签分配不同的岩性物理分布参数，从而加强不同物理场在层界面的结构一致性。
-        """
-        print("Generating diverse background multi-physics properties with correlated heterogeneity...")
-        shape = vp_model.shape
-        
-        # 初始化输出矩阵
-        rho_model = np.zeros_like(vp_model)
-        res_model = np.zeros_like(vp_model)
-        chi_model = np.zeros_like(vp_model)
-        
-        # 1. 噪声场（全局相干）
-        noise_a = self._generate_correlated_noise(shape, sigma=8.0)
-        noise_rw = self._generate_correlated_noise(shape, sigma=15.0)
-        noise_chi = self._generate_correlated_noise(shape, sigma=5.0)
-        
-        # 如果没有层标签，默认当成单一沉积岩层处理
-        if label_vol is None:
-            labels = [0]
-            label_vol = np.zeros_like(vp_model, dtype=int)
-        else:
-            labels = np.unique(label_vol)
-            
-        Vf = np.random.uniform(1450.0, 1600.0) # 全局水速
-        
-        for lbl in labels:
-            mask = (label_vol == lbl)
+    def _depth_norm(self, shape):
+        nz = shape[2]
+        if nz <= 1:
+            return np.zeros(shape, dtype=np.float32)
+        z = np.linspace(0.0, 1.0, nz, dtype=np.float32)
+        return np.broadcast_to(z.reshape(1, 1, nz), shape)
+
+    def _vp_norm(self, vp_model):
+        q05, q95 = np.percentile(vp_model, [5.0, 95.0])
+        scale = max(float(q95 - q05), 1.0)
+        return np.clip((vp_model - q05) / scale, 0.0, 1.0).astype(np.float32)
+
+    def _facies_from_score(self, score):
+        facies = np.full(score.shape, self.FACIES_SANDSTONE, dtype=np.int16)
+        facies[score < 0.38] = self.FACIES_SHALE
+        facies[score >= 0.72] = self.FACIES_CARBONATE
+        return facies
+
+    def _infer_facies_model(self, vp_model, label_vol):
+        depth_norm = self._depth_norm(vp_model.shape)
+        vp_norm = self._vp_norm(vp_model)
+        labels = np.unique(label_vol.astype(np.int32))
+        label_summary = {}
+        facies = np.full(vp_model.shape, self.FACIES_SANDSTONE, dtype=np.int16)
+
+        for label in labels:
+            mask = label_vol == label
             if not np.any(mask):
                 continue
-                
-            # 为每一层随机指派一种"伪岩性"（砂岩/泥岩/碳酸盐岩等特征）
-            litho_type = np.random.choice(['sandstone', 'shale', 'carbonate'])
-            
-            if litho_type == 'sandstone':
-                # 砂岩: 骨架速度居中，电阻率较高，导电性由含水孔隙主导，孔隙度相对较高
-                a_base = np.random.uniform(300.0, 320.0)
-                b = np.random.uniform(0.24, 0.26)
-                Vm = np.random.uniform(5000.0, 5600.0)
-                Rw_base = np.random.uniform(0.5, 2.5) 
-                m = np.random.uniform(1.8, 2.1)
-                chi_mean = np.random.uniform(1e-5, 5e-5)
-                
-            elif litho_type == 'shale':
-                # 泥岩: 密度系数小，骨架速度偏低，含泥质导电（即使Rw高，整体电阻率也相对较低）
-                a_base = np.random.uniform(280.0, 305.0)
-                b = np.random.uniform(0.26, 0.29)
-                Vm = np.random.uniform(4000.0, 4800.0)
-                Rw_base = np.random.uniform(0.1, 0.8) # 模拟泥岩低阻（高矿化度/阳离子交换）
-                m = np.random.uniform(1.9, 2.3)
-                chi_mean = np.random.uniform(5e-5, 1.5e-4) # 泥岩往往含更多顺磁性黏土矿物
-                
-            else: # carbonate
-                # 碳酸盐: 高速高密，致密高阻，极低磁性
-                a_base = np.random.uniform(310.0, 340.0)
-                b = np.random.uniform(0.22, 0.24)
-                Vm = np.random.uniform(6000.0, 7000.0)
-                Rw_base = np.random.uniform(1.0, 4.0)
-                m = np.random.uniform(2.0, 2.5)
-                chi_mean = np.random.uniform(0.0, 2e-5)
 
-            # --- A. 密度 (Gardner) ---
-            a_field = np.clip(a_base + 10.0 * noise_a[mask], 250.0, 350.0)
-            rho_model[mask] = a_field * np.power(vp_model[mask], b)
-            
-            # --- B. 电阻率 (Wyllie + Archie) ---
-            vp_clipped = np.clip(vp_model[mask], Vf + 10, Vm - 10)
-            phi = (1.0/vp_clipped - 1.0/Vm) / (1.0/Vf - 1.0/Vm)
-            phi = np.clip(phi, 0.005, 0.5) # 极少数致密岩必须给个极小孔隙，防止除0
-            
-            Rw_field = np.clip(Rw_base + 0.2 * Rw_base * noise_rw[mask], 0.05, 10.0)
-            
-            # 增加地层微小非均质孔隙/饱和度扰动
-            res_model[mask] = Rw_field / np.power(phi, m)
-            
-            # --- C. 磁化率 ---
-            c_val = chi_mean + (chi_mean * 0.5) * noise_chi[mask]
-            chi_model[mask] = np.clip(c_val, 0.0, None)
-            
+            label_vp = vp_norm[mask]
+            label_depth = depth_norm[mask]
+            label_vp_med = float(np.median(label_vp))
+            label_depth_med = float(np.median(label_depth))
+            label_score = 0.70 * label_vp_med + 0.30 * label_depth_med
+            base_facies = int(self._facies_from_score(np.array([label_score], dtype=np.float32))[0])
+
+            # cell_score = 0.55 * vp_norm[mask] + 0.30 * label_score + 0.15 * depth_norm[mask]
+            cell_score = 0.65 * vp_norm[mask] + 0.35 * label_score
+            cell_facies = self._facies_from_score(cell_score)
+
+            if base_facies == self.FACIES_SHALE:
+                cell_facies = np.minimum(cell_facies, self.FACIES_SANDSTONE)
+            elif base_facies == self.FACIES_CARBONATE:
+                cell_facies = np.maximum(cell_facies, self.FACIES_SANDSTONE)
+
+            facies[mask] = cell_facies
+            label_summary[int(label)] = {
+                "base_facies": self.FACIES_NAMES[base_facies],
+                "median_vp_norm": label_vp_med,
+                "median_depth_norm": label_depth_med,
+                "score": label_score,
+            }
+
+        return facies, label_summary, depth_norm, vp_norm
+
+    def _build_background_controls(self, vp_model, facies, depth_norm, vp_norm):
+        shape = vp_model.shape
+        phi_model = np.zeros(shape, dtype=np.float32)
+        rw_model = np.zeros(shape, dtype=np.float32)
+        sw_model = np.ones(shape, dtype=np.float32)
+        rho_model = np.zeros(shape, dtype=np.float32)
+        chi_model = np.zeros(shape, dtype=np.float32)
+
+        noise_phi = self._generate_correlated_noise(shape, sigma=10.0)
+        noise_rw = self._generate_correlated_noise(shape, sigma=14.0)
+        noise_rho = self._generate_correlated_noise(shape, sigma=8.0)
+        noise_chi = self._generate_correlated_noise(shape, sigma=6.0)
+
+        for facies_id, params in self.FACIES_PARAMS.items():
+            mask = facies == facies_id
+            if not np.any(mask):
+                continue
+
+            vp_local = vp_model[mask]
+            depth_local = depth_norm[mask]
+            vp_clipped = np.clip(vp_local, params["vf"] + 20.0, params["vm"] - 50.0)
+
+            phi_depth = params["phi_min"] + (params["phi0"] - params["phi_min"]) * np.exp(-params["compaction"] * depth_local)
+            phi_vp = (1.0 / vp_clipped - 1.0 / params["vm"]) / (1.0 / params["vf"] - 1.0 / params["vm"])
+            phi_vp = np.clip(phi_vp, params["phi_min"], params["phi_max"])
+
+            phi_local = params["phi_blend"] * phi_vp + (1.0 - params["phi_blend"]) * phi_depth
+            phi_local = phi_local * np.exp(0.10 * noise_phi[mask])
+            phi_model[mask] = np.clip(phi_local, params["phi_min"], params["phi_max"])
+
+            rw_local = params["rw_surface"] + (params["rw_deep"] - params["rw_surface"]) * depth_local
+            rw_local = rw_local * np.exp(0.08 * noise_rw[mask])
+            rw_model[mask] = np.clip(rw_local, 0.03, 2.5)
+
+            rho_local = params["density_a"] * np.power(np.clip(vp_local, 1200.0, None), params["density_b"])
+            rho_local = rho_local * np.exp(0.035 * noise_rho[mask])
+            rho_model[mask] = np.clip(rho_local, *params["density_clip"])
+
+            chi_local = params["chi_mean"] + params["chi_span"] * 0.35 * noise_chi[mask]
+            chi_model[mask] = np.clip(chi_local, 0.0, None)
+
+        return rho_model, rw_model, sw_model, phi_model, chi_model
+
+    def _compute_resistivity_from_controls(self, facies, vp_norm, depth_norm, phi_model, sw_model, rw_model):
+        res_model = np.zeros_like(phi_model, dtype=np.float32)
+
+        for facies_id, params in self.FACIES_PARAMS.items():
+            mask = facies == facies_id
+            if not np.any(mask):
+                continue
+
+            phi = np.clip(phi_model[mask], params["phi_min"], params["phi_max"])
+            sw = np.clip(sw_model[mask], 0.05, 1.0)
+            rw = np.clip(rw_model[mask], 0.03, 2.5)
+            vp_local = vp_norm[mask]
+            depth_local = depth_norm[mask]
+
+            sigma_clean = np.power(phi, params["archie_m"]) * np.power(sw, params["archie_n"]) / (params["archie_a"] * rw)
+            clay_frac = params["clay_base"] + params["clay_span"] * (1.0 - vp_local) * (0.65 + 0.35 * (1.0 - depth_local))
+            clay_frac = np.clip(clay_frac, 0.0, 0.95)
+            rho_sh = params["clay_res_base"] * (1.0 + 0.35 * depth_local)
+            sigma_clay = clay_frac / np.clip(rho_sh, 0.1, None)
+            sigma_total = sigma_clean * (1.0 - 0.5 * clay_frac) + sigma_clay
+            res_local = 1.0 / np.clip(sigma_total, 1.0e-6, None)
+            res_model[mask] = np.clip(res_local, *params["res_clip"])
+
+        return res_model
+
+    def _summarize_background(self, res_model, facies, label_summary):
+        positive = res_model[res_model > 0.0]
+        if positive.size == 0:
+            self.last_background_qc = None
+            return
+
+        summary = {
+            "min": float(np.min(positive)),
+            "p05": float(np.percentile(positive, 5.0)),
+            "median": float(np.median(positive)),
+            "p95": float(np.percentile(positive, 95.0)),
+            "max": float(np.max(positive)),
+            "mean": float(np.mean(positive)),
+            "facies_fraction": {
+                self.FACIES_NAMES[idx]: float(np.mean(facies == idx))
+                for idx in self.FACIES_NAMES
+            },
+            "label_summary": label_summary,
+        }
+        self.last_background_qc = summary
+
+        print("Background facies fractions:")
+        for facies_name, fraction in summary["facies_fraction"].items():
+            print(f"  - {facies_name}: {fraction:.2%}")
+        print(
+            "Background resistivity stats: "
+            f"min={summary['min']:.3g}, p05={summary['p05']:.3g}, median={summary['median']:.3g}, "
+            f"p95={summary['p95']:.3g}, max={summary['max']:.3g}, mean={summary['mean']:.3g}"
+        )
+
+    def get_last_background_state(self):
+        return self._background_state
+
+    def generate_background(self, vp_model, label_vol=None):
+        print("Generating facies-aware background multi-physics properties...")
+        vp_model = np.asarray(vp_model, dtype=np.float32)
+        if label_vol is None:
+            label_vol = np.zeros_like(vp_model, dtype=np.int32)
+        else:
+            label_vol = np.asarray(label_vol, dtype=np.int32)
+            if label_vol.shape != vp_model.shape:
+                raise ValueError("label_vol must have the same shape as vp_model")
+
+        facies, label_summary, depth_norm, vp_norm = self._infer_facies_model(vp_model, label_vol)
+        rho_model, rw_model, sw_model, phi_model, chi_model = self._build_background_controls(vp_model, facies, depth_norm, vp_norm)
+        res_model = self._compute_resistivity_from_controls(facies, vp_norm, depth_norm, phi_model, sw_model, rw_model)
+
+        self._background_state = {
+            "facies": facies.copy(),
+            "depth_norm": depth_norm,
+            "vp_norm": vp_norm,
+            "phi": phi_model.copy(),
+            "rw": rw_model.copy(),
+            "sw": sw_model.copy(),
+            "rho": rho_model.copy(),
+            "res": res_model.copy(),
+            "chi": chi_model.copy(),
+            "label_summary": label_summary,
+        }
+        self._summarize_background(res_model, facies, label_summary)
         return rho_model, res_model, chi_model
 
+    def _generate_heterogeneous_prop(self, shape, mask, low, high, noise_level=0.05, sigma=4.0):
+        base_val = self.rng.uniform(low, high)
+        noise = self._generate_correlated_noise(shape, sigma=sigma)
+        values = base_val + base_val * noise_level * noise[mask]
+        return np.clip(values, low * 0.8, high * 1.2)
+
+    def _generate_log_heterogeneous_prop(self, shape, mask, low, high, noise_level=0.12, sigma=4.0):
+        log_low = np.log10(low)
+        log_high = np.log10(high)
+        log_base = self.rng.uniform(log_low, log_high)
+        noise = self._generate_correlated_noise(shape, sigma=sigma)
+        log_values = log_base + noise_level * noise[mask]
+        log_values = np.clip(log_values, log_low - 0.2, log_high + 0.2)
+        return np.power(10.0, log_values)
+
     def apply_anomaly(self, mask, anomaly_type, vp, rho, res, chi):
-        """
-        为地质异常体赋予区间随机采样的多物理场属性。
-        使用3D过滤噪声模拟地质体内部的物性不均匀分布。
-        """
         mask = mask.astype(bool)
         if not np.any(mask):
             return vp, rho, res, chi
-            
+
+        vp = np.asarray(vp, dtype=np.float32)
+        rho = np.asarray(rho, dtype=np.float32)
+        res = np.asarray(res, dtype=np.float32)
+        chi = np.asarray(chi, dtype=np.float32)
         shape = vp.shape
 
-        # 辅助函数：生成包含均值采样和全空间相干扰动数组
-        def generate_heterogeneous_prop(low, high, noise_level=0.05, sigma=4.0):
-            base_val = np.random.uniform(low, high)
-            noise_3d = self._generate_correlated_noise(shape, sigma=sigma)
-            # 在基准值上叠加 3D 空间内的相干波动
-            vals = base_val + base_val * noise_level * noise_3d[mask]
-            return np.clip(vals, low * 0.8, high * 1.2) # 限制极端值
-            
-        def generate_log_heterogeneous_prop(low, high, noise_level=0.1, sigma=4.0):
-            """专门为跨度大的属性（如电阻率）对数域生成分布"""
-            log_low, log_high = np.log10(low), np.log10(high)
-            log_base = np.random.uniform(log_low, log_high)
-            noise_3d = self._generate_correlated_noise(shape, sigma=sigma)
-            # 在对数域上加减扰动 (noise_level为对数尺度的标准差)
-            log_vals = log_base + noise_level * noise_3d[mask]
-            log_vals = np.clip(log_vals, log_low - 0.2, log_high + 0.2)
-            return np.power(10, log_vals)
+        state = self._background_state
+        if state is None or state["facies"].shape != shape:
+            facies, _, depth_norm, vp_norm = self._infer_facies_model(vp, np.zeros_like(vp, dtype=np.int32))
+            phi = np.full(shape, 0.12, dtype=np.float32)
+            rw = np.full(shape, 0.18, dtype=np.float32)
+            sw = np.ones(shape, dtype=np.float32)
+        else:
+            facies = state["facies"].copy()
+            depth_norm = state["depth_norm"]
+            vp_norm = state["vp_norm"]
+            phi = state["phi"].copy()
+            rw = state["rw"].copy()
+            sw = state["sw"].copy()
 
-        if anomaly_type == 'Igneous':
-            vp[mask]  = generate_heterogeneous_prop(5000.0, 6500.0, noise_level=0.05)
-            rho[mask] = generate_heterogeneous_prop(2700.0, 3100.0, noise_level=0.03)
-            # 火成岩电阻率和磁性不均匀极其显著
-            res[mask] = generate_log_heterogeneous_prop(2000.0, 10000.0, noise_level=0.2, sigma=6.0)
-            chi[mask] = generate_heterogeneous_prop(0.01, 0.08, noise_level=0.20)
-            
-        elif anomaly_type == 'Sulfide':
-            vp[mask]  = generate_heterogeneous_prop(5500.0, 6800.0, noise_level=0.04)
-            rho[mask] = generate_heterogeneous_prop(3500.0, 4800.0, noise_level=0.05)
-            res[mask] = generate_log_heterogeneous_prop(0.001, 0.1, noise_level=0.3, sigma=3.0) # 极低阻金属矿
-            chi[mask] = generate_heterogeneous_prop(0.05, 0.2, noise_level=0.15)  # 高磁性
-            
-        elif anomaly_type == 'Gas':
-            vp[mask]  = generate_heterogeneous_prop(1400.0, 2200.0, noise_level=0.05)
-            rho[mask] = generate_heterogeneous_prop(1500.0, 2000.0, noise_level=0.03)
-            # 气体由于饱和度的相干变化，导致电阻率放大倍数也应该是相干的
-            base_multiplier_log = np.random.uniform(np.log10(5.0), np.log10(50.0))
-            noise_res = self._generate_correlated_noise(shape, sigma=6.0)
-            multiplier_log_field = base_multiplier_log + 0.2 * noise_res[mask]
-            multiplier_field = np.power(10, np.clip(multiplier_log_field, np.log10(2.0), np.log10(100.0)))
-            res[mask] = res[mask] * multiplier_field
-            
-            # 抗磁气体自身磁化率几乎没有空间非均质
-            chi_gas = np.random.uniform(-1e-5, 0)
-            chi[mask] = chi_gas 
-            
-        elif anomaly_type == 'Hydrate':
-            vp[mask]  = generate_heterogeneous_prop(3000.0, 4200.0, noise_level=0.08)
-            # 密度轻微下降，下降系数引入相干空间变动
-            rho_decay_base = np.random.uniform(0.90, 0.98)
-            noise_rho = self._generate_correlated_noise(shape, sigma=5.0)
-            rho_decay_field = np.clip(rho_decay_base + 0.02 * noise_rho[mask], 0.85, 0.99)
-            rho[mask] = rho[mask] * rho_decay_field
-            
-            # 水合物饱和度高度不均匀，对电阻率影响极大，采用对数相干扰动
-            res_mult_base_log = np.random.uniform(np.log10(3.0), np.log10(15.0))
-            noise_res = self._generate_correlated_noise(shape, sigma=4.0)
-            res_mult_log_field = res_mult_base_log + 0.2 * noise_res[mask]
-            res_mult_field = np.power(10, np.clip(res_mult_log_field, np.log10(1.5), np.log10(30.0)))
-            res[mask] = res[mask] * res_mult_field
-            
-        elif anomaly_type == 'BrineFault':
-            # 破碎带：孔隙度和裂缝的相干变化引起 Vp/密度下降
-            vp_decay_base = np.random.uniform(0.85, 0.98)
-            rho_decay_base = np.random.uniform(0.90, 0.98)
-            noise_fault = self._generate_correlated_noise(shape, sigma=8.0)
-            
-            vp_decay_field = np.clip(vp_decay_base + 0.03 * noise_fault[mask], 0.70, 0.99)
-            rho_decay_field = np.clip(rho_decay_base + 0.02 * noise_fault[mask], 0.80, 0.99)
-            
-            vp[mask]  = vp[mask] * vp_decay_field
-            rho[mask] = rho[mask] * rho_decay_field
-            
-            # 卤水充填极低阻，由于裂缝通道不同产生相干分布
-            res[mask] = generate_log_heterogeneous_prop(0.1, 2.0, noise_level=0.3, sigma=3.0)
-            
-        elif anomaly_type == 'Serpentinized':
-            vp_decay_base = np.random.uniform(0.65, 0.85)
-            rho_decay_base = np.random.uniform(0.80, 0.92)
-            noise_serp = self._generate_correlated_noise(shape, sigma=10.0)
-            
-            vp[mask] = vp[mask] * np.clip(vp_decay_base + 0.05 * noise_serp[mask], 0.5, 0.95)
-            rho[mask] = rho[mask] * np.clip(rho_decay_base + 0.03 * noise_serp[mask], 0.7, 0.98)
-            
-            # 生成磁铁矿，磁化率绝对增加，具有相干斑块特征
-            chi_add_base = np.random.uniform(0.01, 0.05)
-            chi_add_field = chi_add_base + chi_add_base * 0.2 * noise_serp[mask]
-            chi[mask] = chi[mask] + np.clip(chi_add_field, 0.0, 0.1)
-            
-            res[mask] = generate_log_heterogeneous_prop(50.0, 500.0, noise_level=0.3, sigma=5.0)
-            
-        elif anomaly_type == 'SaltDome':
-            vp[mask]  = generate_heterogeneous_prop(4200.0, 5500.0, noise_level=0.02, sigma=15.0)
-            # 盐非常均质
-            rho[mask] = generate_heterogeneous_prop(2100.0, 2250.0, noise_level=0.01, sigma=20.0)
-            res[mask] = generate_log_heterogeneous_prop(10000.0, 50000.0, noise_level=0.1, sigma=10.0)
-            chi[mask] = np.random.uniform(-1.5e-5, -0.5e-5) # 抗磁且高度均质
-            
+        noise = self._generate_correlated_noise(shape, sigma=6.0)
+
+        if anomaly_type == "Gas":
+            vp[mask] = np.clip(vp[mask] * np.clip(0.62 + 0.08 * noise[mask], 0.45, 0.82), 1400.0, None)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.90 + 0.04 * noise[mask], 0.82, 0.98), 1400.0, None)
+            facies[mask] = np.maximum(facies[mask], self.FACIES_SANDSTONE)
+            phi[mask] = np.clip(phi[mask] * np.clip(1.10 + 0.05 * noise[mask], 0.95, 1.25), 0.05, 0.35)
+            sw[mask] = np.clip(0.20 + 0.10 * (1.0 + noise[mask]), 0.05, 0.45)
+            rw[mask] = np.clip(rw[mask] * np.clip(1.05 + 0.05 * noise[mask], 0.9, 1.2), 0.03, 2.5)
+            chi[mask] = np.clip(-1.0e-5 + 2.0e-6 * noise[mask], -2.0e-5, 0.0)
+            vp_norm = self._vp_norm(vp)
+            res = self._compute_resistivity_from_controls(facies, vp_norm, depth_norm, phi, sw, rw)
+
+        elif anomaly_type == "Hydrate":
+            vp[mask] = np.clip(vp[mask] * np.clip(1.18 + 0.08 * noise[mask], 1.05, 1.35), None, 4500.0)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.93 + 0.03 * noise[mask], 0.86, 0.99), 1500.0, None)
+            facies[mask] = np.maximum(facies[mask], self.FACIES_SANDSTONE)
+            phi[mask] = np.clip(phi[mask] * np.clip(0.86 + 0.05 * noise[mask], 0.70, 0.96), 0.02, 0.25)
+            sw[mask] = np.clip(0.45 + 0.12 * (1.0 + noise[mask]), 0.20, 0.70)
+            vp_norm = self._vp_norm(vp)
+            res = self._compute_resistivity_from_controls(facies, vp_norm, depth_norm, phi, sw, rw)
+
+        elif anomaly_type == "BrineFault":
+            vp[mask] = np.clip(vp[mask] * np.clip(0.82 + 0.06 * noise[mask], 0.65, 0.96), 1400.0, None)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.92 + 0.04 * noise[mask], 0.80, 0.98), 1500.0, None)
+            facies[mask] = self.FACIES_SHALE
+            phi[mask] = np.clip(phi[mask] * np.clip(1.22 + 0.10 * noise[mask], 1.05, 1.60), 0.08, 0.40)
+            sw[mask] = np.clip(0.95 + 0.03 * noise[mask], 0.80, 1.0)
+            rw[mask] = np.clip(rw[mask] * np.clip(0.22 + 0.06 * (1.0 + noise[mask]), 0.08, 0.40), 0.01, 0.5)
+            vp_norm = self._vp_norm(vp)
+            res = self._compute_resistivity_from_controls(facies, vp_norm, depth_norm, phi, sw, rw)
+
+        elif anomaly_type == "Sulfide":
+            vp[mask] = self._generate_heterogeneous_prop(shape, mask, 5500.0, 6800.0, noise_level=0.04)
+            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 3500.0, 4800.0, noise_level=0.05)
+            res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 0.001, 0.1, noise_level=0.22, sigma=3.0)
+            chi[mask] = self._generate_heterogeneous_prop(shape, mask, 0.05, 0.2, noise_level=0.15)
+
+        elif anomaly_type == "Igneous":
+            vp[mask] = self._generate_heterogeneous_prop(shape, mask, 5000.0, 6500.0, noise_level=0.05)
+            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 2700.0, 3100.0, noise_level=0.03)
+            res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 2000.0, 10000.0, noise_level=0.15, sigma=6.0)
+            chi[mask] = self._generate_heterogeneous_prop(shape, mask, 0.01, 0.08, noise_level=0.20)
+
+        elif anomaly_type == "Serpentinized":
+            vp[mask] = np.clip(vp[mask] * np.clip(0.76 + 0.08 * noise[mask], 0.55, 0.92), 1800.0, None)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.88 + 0.04 * noise[mask], 0.75, 0.97), 1800.0, None)
+            res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 50.0, 500.0, noise_level=0.18, sigma=5.0)
+            chi[mask] = np.clip(chi[mask] + self._generate_heterogeneous_prop(shape, mask, 0.01, 0.05, noise_level=0.20), 0.0, 0.1)
+
+        elif anomaly_type == "SaltDome":
+            vp[mask] = self._generate_heterogeneous_prop(shape, mask, 4200.0, 5500.0, noise_level=0.02, sigma=14.0)
+            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 2100.0, 2250.0, noise_level=0.01, sigma=18.0)
+            res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 8000.0, 30000.0, noise_level=0.08, sigma=10.0)
+            chi[mask] = np.clip(-1.0e-5 + 2.0e-6 * noise[mask], -2.0e-5, 0.0)
+
         else:
             print(f"Warning: Unknown anomaly type '{anomaly_type}'")
-            
+
+        self._background_state = {
+            "facies": facies.copy(),
+            "depth_norm": depth_norm,
+            "vp_norm": self._vp_norm(vp),
+            "phi": phi.copy(),
+            "rw": rw.copy(),
+            "sw": sw.copy(),
+            "rho": rho.copy(),
+            "res": res.copy(),
+            "chi": chi.copy(),
+            "label_summary": state["label_summary"] if state is not None and "label_summary" in state else {},
+        }
         return vp, rho, res, chi

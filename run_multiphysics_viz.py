@@ -29,7 +29,7 @@ def read_segy_volume(path):
     dx, dy, dz = 10.0, 10.0, 25.0
     return vol, (dx, dy, dz)
 
-def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, vp_bg, label_vol, dx, dy, dz, run_app=False):
+def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, vp_bg, label_vol, dx, dy, dz, run_app=False, show_colorbar=True):
     """
     基于速度模型生成多物理场属性（密度，电阻率，磁化率），叠加异常体，并使用 cigvis 进行可视化。
     """
@@ -56,20 +56,24 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
     )
     
     # 保存与可视化准备
-    save_dir = "/home/wangyh/Project/GMESUni/GMESDataset/DATAFOLDER/Cache/"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    save_dir = os.path.join(base_dir, "DATAFOLDER", "Cache/", "Fig")
     os.makedirs(save_dir, exist_ok=True)
     
     # 磁化率放大数值便于可视化
     chi_multi_scaled = chi_multi * 1e5
     
     # 获取各个场的合理取值范围 (clim)，用于切片色标和表面物理场上色
-    clim_vp = [vp_multi.min(), vp_multi.max()]
-    clim_rho = [rho_multi.min(), rho_multi.max()]
+    def _safe_clim(vmin, vmax, eps=1e-5):
+        return [vmin, vmax] if vmax > vmin else [vmin, vmax + eps]
+
+    clim_vp = _safe_clim(vp_multi.min(), vp_multi.max())
+    clim_rho = _safe_clim(rho_multi.min(), rho_multi.max())
     
-    log_res_multi = np.log10(res_multi)
+    log_res_multi = np.log10(np.clip(res_multi, a_min=1e-5, a_max=None))
     # 电阻率跨度极大，往往取对数以保证可视化效果
-    clim_res = [log_res_multi.min(), log_res_multi.max()]
-    clim_chi = [chi_multi_scaled.min(), chi_multi_scaled.max()]
+    clim_res = _safe_clim(log_res_multi.min(), log_res_multi.max())
+    clim_chi = _safe_clim(chi_multi_scaled.min(), chi_multi_scaled.max())
 
     # 在四个子窗口分别创建模型基础切片
     nodes_vp = cigvis.create_slices(vp_multi, cmap='jet', clim=clim_vp)
@@ -134,15 +138,13 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
             ):
                 mask_nodes = cigvis.create_bodys(sub_mask, level=0.5, color='white', alpha=1.0)
                 if mask_nodes:
+                    import scipy.ndimage as ndimage
                     node = mask_nodes[0]
                     verts = node.mesh_data.get_vertices()
                     if verts is not None and len(verts) > 0:
-                        coords = np.round(verts).astype(int)
-                        coords[:, 0] = np.clip(coords[:, 0], 0, vol.shape[0] - 1)
-                        coords[:, 1] = np.clip(coords[:, 1], 0, vol.shape[1] - 1)
-                        coords[:, 2] = np.clip(coords[:, 2], 0, vol.shape[2] - 1)
-                        
-                        vals = vol[coords[:, 0], coords[:, 1], coords[:, 2]]
+                        # 采用三线性插值(order=1)以消除浮点坐标强转整数带来的莫尔条纹/锯齿
+                        coords = verts.T  # map_coordinates expect shape (3, N)
+                        vals = ndimage.map_coordinates(vol, coords, order=1, mode='nearest')
                         
                         norm = mcolors.Normalize(vmin=clim[0], vmax=clim[1])
                         scalar_map = cm.ScalarMappable(norm=norm, cmap='jet')
@@ -157,16 +159,17 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
     # ---------------- 异常体可视化结束 ----------------
 
     # 统一增加 colorbar
-    cb_vp = cigvis.create_colorbar_from_nodes(nodes_vp, label_str="Vp (m/s)")
-    cb_rho = cigvis.create_colorbar_from_nodes(nodes_rho, label_str="Density (kg/m^3)")
-    cb_res = cigvis.create_colorbar_from_nodes(nodes_res, label_str="log10(Res)")
-    cb_chi = cigvis.create_colorbar_from_nodes(nodes_chi, label_str="Suscept(1e-5SI)")
-    
-    for nds, cb in zip((nodes_vp, nodes_rho, nodes_res, nodes_chi), (cb_vp, cb_rho, cb_res, cb_chi)):
-        if isinstance(cb, list):
-            nds.extend(cb)
-        else:
-            nds.append(cb)
+    if show_colorbar:
+        cb_vp = cigvis.create_colorbar_from_nodes(nodes_vp, label_str="Vp (m/s)")
+        cb_rho = cigvis.create_colorbar_from_nodes(nodes_rho, label_str="Density (kg/m^3)")
+        cb_res = cigvis.create_colorbar_from_nodes(nodes_res, label_str="log10(Res)")
+        cb_chi = cigvis.create_colorbar_from_nodes(nodes_chi, label_str="Suscept(1e-5SI)")
+        
+        for nds, cb in zip((nodes_vp, nodes_rho, nodes_res, nodes_chi), (cb_vp, cb_rho, cb_res, cb_chi)):
+            if isinstance(cb, list):
+                nds.extend(cb)
+            else:
+                nds.append(cb)
     
     out_file = f"Multiphysics_{name_en}-{name_zh}.png"
     out_path = os.path.join(save_dir, out_file)
@@ -178,7 +181,7 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
         savename=out_file, 
         savedir=save_dir, 
         run_app=run_app, 
-        title=[f"Vp (m/s) - {name_zh}", f"Density (kg/m3)", f"log10(Resistivity) (Ohm.m)", f"Susceptibility (x1e-5 SI)"]
+        title=[f"Vp (m/s) - {name_zh}", f"Density (kg/m^3)", f"log10(Resistivity) (Ohm.m)", f"Susceptibility (x1e-5 SI)"]
     )
     print(f"Saved Multiphysics Visualization: {out_path}")
 
@@ -187,10 +190,13 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_app", action="store_true", help="Launch cigvis GUI for checking visuals interactively.")
+    parser.add_argument("--hide_colorbar", action="store_true", help="Hide colorbars in the output visualization.")
+    parser.add_argument("--vp_segy", type=str, default="/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Velocity_choas/braided/AYL-00000.sgy", help="Path to background Vp SEGY.")
+    parser.add_argument("--label_segy", type=str, default="/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Layer_choas/braided/AYL-00000.sgy", help="Path to background label SEGY.")
     args = parser.parse_args()
 
-    vp_segy_path = "/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Velocity_choas/braided/AYL-00000.sgy"
-    label_segy_path = "/home/wangyh/DATAFOLDER/3DSeismic/AYLModel/3DExample/Layer_choas/braided/AYL-00000.sgy"
+    vp_segy_path = args.vp_segy
+    label_segy_path = args.label_segy
     
     try:
         vp_bg, (dx, dy, dz) = read_segy_volume(vp_segy_path)
@@ -198,15 +204,7 @@ def main():
         nx, ny, nz = vp_bg.shape
         print(f'Velocity shape = {nx, ny, nz}, dx={dx}, dy={dy}, dz={dz}')
     except Exception as e:
-        print(f"Failed to load SEGY: {e}. Generating synthetic backup...")
-        nx, ny, nz = 300, 300, 200
-        dx, dy, dz = 10.0, 10.0, 25.0
-        vp_bg = np.zeros((nx, ny, nz), dtype=np.float32)
-        for k in range(nz):
-            vp_bg[:, :, k] = 2000.0 + k * dz * 0.5
-        label_vol = np.zeros((nx, ny, nz), dtype=np.int32)
-        label_vol[:, :, 40:80] = 1
-        label_vol[:, :, 80:120] = 2
+        raise RuntimeError(f"Failed to read SEGY volumes: {e}")
 
     # 1. Dyke Swarm -> Igneous
     swarm_params = IgneousIntrusionParams(
@@ -217,7 +215,7 @@ def main():
     )
     generate_multiphysics_and_plot(
         IgneousIntrusion(params=swarm_params, layer_labels=None, rng_seed=101),
-        "Igneous", "Igneous_Swarm", "岩墙群", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app
+        "Igneous", "Igneous_Swarm", "岩墙群", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
     )
     
     # 2. Gas Reservoir -> Gas
@@ -228,7 +226,7 @@ def main():
     )
     generate_multiphysics_and_plot(
         HydrocarbonHydrate(params=gas_params, layer_labels=label_vol),
-        "Gas", "Hydrocarbon_Gas", "气藏", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app
+        "Gas", "Hydrocarbon_Gas", "气藏", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
     )
 
     # 3. Gas Hydrate -> Hydrate
@@ -239,14 +237,14 @@ def main():
     )
     generate_multiphysics_and_plot(
         HydrocarbonHydrate(params=hyd_params, layer_labels=label_vol),
-        "Hydrate", "Hydrocarbon_Hydrate", "天然气水合物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app
+        "Hydrate", "Hydrocarbon_Hydrate", "天然气水合物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
     )
 
     # 4. Brine Fault Zone -> BrineFault
     brine_params = BrineFaultZoneParams(top_k=2, fault_quantile=0.996, core_thickness_m=40.0)
     generate_multiphysics_and_plot(
         BrineFaultZone(params=brine_params, vp_ref=vp_bg, rng_seed=999),
-        "BrineFault", "Brine_Fault", "含卤水断层", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app
+        "BrineFault", "Brine_Fault", "含卤水断层", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
     )
 
     # 5. Massive Sulfide -> Sulfide
@@ -256,14 +254,28 @@ def main():
     )
     generate_multiphysics_and_plot(
         MassiveSulfide(params=mass_sulfide_params, layer_labels=label_vol),
-        "Sulfide", "Massive_Sulfide", "块状硫化物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app
+        "Sulfide", "Massive_Sulfide", "块状硫化物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
     )
     
     # 6. Salt Dome -> SaltDome
     salt_params = SaltDomeAnomaly.create_random_params((nx, ny, nz), (dx, dy, dz), seed=333)
     salt_dome = SaltDomeAnomaly(type="salt_dome", strength=0.0, edge_width_m=20.0, params=salt_params, rng_seed=333)
     generate_multiphysics_and_plot(
-        salt_dome, "SaltDome", "Salt_Dome", "盐丘", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app
+        salt_dome, "SaltDome", "Salt_Dome", "盐丘", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
+    )
+    
+    # 7. Sediment Basement Interface -> Basement
+    base_params = SedimentBasementParams()
+    generate_multiphysics_and_plot(
+        SedimentBasementInterface(params=base_params, layer_labels=label_vol),
+        "Basement", "Sediment_Basement", "沉积-基底界面", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
+    )
+
+    # 8. Serpentinized Zone -> Serpentinized
+    serp_params = SerpentinizedZoneParams()
+    generate_multiphysics_and_plot(
+        SerpentinizedZone(params=serp_params, layer_labels=label_vol),
+        "Serpentinized", "Serpentinized_Zone", "蛇纹石化带", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
     )
 
 if __name__ == '__main__':

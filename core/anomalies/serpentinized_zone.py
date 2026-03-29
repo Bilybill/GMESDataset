@@ -20,7 +20,7 @@ Outputs:
 - soft_mask(): continuous [0,1] mask (core)
 - mask(): binary mask (>0.5)
 - apply_to_vp(): modifies Vp
-- build_property_models(): creates density (g/cc) and susceptibility (SI) volumes plus subtype labels
+- build_property_models(): creates density (kg/m^3) and susceptibility (SI) volumes plus subtype labels
   (you can integrate these into your multi-physics pipeline like SBI did).
 
 Conventions:
@@ -476,7 +476,7 @@ class SerpentinizedZoneParams:
     chi_add_SI: float = 0.02          # susceptibility increase (absolute add)
     resist_delta_frac: float = -0.3   # resistivity decrease due to secondary minerals/fluids
 
-    # Background property defaults for build_property_models (if not provided)
+    # Background density param stays in g/cc for backward compatibility and is converted to kg/m^3.
     rho_bg_gcc: float = 2.70
     chi_bg_SI: float = 0.001
 
@@ -557,16 +557,18 @@ class SerpentinizedZone(Anomaly):
         chi_bg_SI: Optional[np.ndarray] = None,
     ) -> Dict[str, np.ndarray]:
         """
-        Create density and susceptibility volumes and a subtype label volume.
+        Create density (kg/m^3) and susceptibility volumes and a subtype label volume.
         If vp_bg is provided, the same core mask can also be used to output a modified vp (optional).
         """
         p = self.params
         nx, ny, nz = Z.shape
 
         if rho_bg_gcc is None:
-            rho_bg = np.full((nx, ny, nz), float(p.rho_bg_gcc), dtype=np.float32)
+            rho_bg = np.full((nx, ny, nz), 1000.0 * float(p.rho_bg_gcc), dtype=np.float32)
         else:
             rho_bg = rho_bg_gcc.astype(np.float32, copy=False)
+            if float(np.nanmax(rho_bg)) < 50.0:
+                rho_bg = rho_bg * 1000.0
 
         if chi_bg_SI is None:
             chi_bg = np.full((nx, ny, nz), float(p.chi_bg_SI), dtype=np.float32)
@@ -594,7 +596,9 @@ class SerpentinizedZone(Anomaly):
         sub[m_core > 0.5] = int(p.subtype_core)
 
         out = {
-            "rho_gcc": rho.astype(np.float32),
+            "rho": rho.astype(np.float32),
+            "rho_kgm3": rho.astype(np.float32),
+            "rho_gcc": (rho / 1000.0).astype(np.float32),
             "chi_SI": chi.astype(np.float32),
             "subtype": sub,
             "mask_core": m_core.astype(np.float32),

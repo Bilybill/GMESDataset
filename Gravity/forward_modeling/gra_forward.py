@@ -67,7 +67,7 @@ def forward_gravity_gz(
     G: float = 6.67430e-11,
     output_unit: str = "mgal",
     pad_factor: int = 2,
-    density_unit: str = "kg/m3",
+    density_unit: str = "kg/m^3",
 ) -> Tuple[torch.Tensor, Dict]:
     """
     Gravity forward modeling (vertical component gz) for a 3D density model.
@@ -92,13 +92,13 @@ def forward_gravity_gz(
 
     # Unit handling: this forward assumes density in kg/m^3.
     # If your input is in g/cm^3, multiply by 1000 to convert to kg/m^3.
-    du = (density_unit or "kg/m3").lower().replace(" ", "")
+    du = (density_unit or "kg/m^3").lower().replace(" ", "")
     if du in ["g/cm3", "g/cc", "gcc"]:
         density = density * 1000.0
     elif du in ["kg/m3", "kg/m^3", "kgm3"]:
         pass
     else:
-        raise ValueError(f"Unknown density_unit: {density_unit}. Use 'kg/m3' or 'g/cm3'.")
+        raise ValueError(f"Unknown density_unit: {density_unit}. Use 'kg/m^3' or 'g/cm3'.")
 
     device = density.device
     nx, ny, nz = density.shape
@@ -119,6 +119,7 @@ def forward_gravity_gz(
         "dx": torch.tensor([dx, dy, dz], dtype=torch.float32),
         "G": float(G),
         "output_unit": output_unit,
+        "density_unit": "kg/m^3",
         "pad_factor": int(pad_factor),
         "model_shape": (nx, ny, nz),
     }

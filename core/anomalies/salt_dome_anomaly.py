@@ -127,7 +127,7 @@ class SaltDomeParams:
     Lz: float = 3200.0
 
     # Multi-physics core properties
-    rho_salt_gcc: float = 2.15      # Typical low density for salt relative to compacted sediments
+    rho_salt_gcc: float = 2.15      # Legacy g/cc param, converted to kg/m^3 for rho grids
     resist_salt_ohmm: float = 3000.0 # Highly resistive
     chi_salt_si: float = -0.00001   # Diamagnetic (negative susceptibility)
 
@@ -261,7 +261,7 @@ class SaltDomeAnomaly(Anomaly):
         
         salt_vals = {
             'vp': p.vp_salt_mps,
-            'rho': p.rho_salt_gcc,
+            'rho': 1000.0 * p.rho_salt_gcc,
             'resist': p.resist_salt_ohmm,
             'chi': p.chi_salt_si
         }

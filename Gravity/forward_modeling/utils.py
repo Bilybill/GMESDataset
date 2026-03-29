@@ -5,6 +5,26 @@ import torch
 from loguru import logger
 
 
+CANONICAL_DENSITY_UNIT = "kg/m^3"
+
+
+def _normalize_density_unit(density_unit: str) -> str:
+    unit = (density_unit or CANONICAL_DENSITY_UNIT).lower().replace(" ", "")
+    if unit in ["kg/m3", "kg/m^3", "kgm3"]:
+        return CANONICAL_DENSITY_UNIT
+    if unit in ["g/cm3", "g/cc", "gcc"]:
+        return "g/cc"
+    raise ValueError(f"Unknown density_unit: {density_unit}. Use 'kg/m^3' or 'g/cm3'.")
+
+
+def _convert_density_to_kgm3(arr: np.ndarray, density_unit: str) -> np.ndarray:
+    unit = _normalize_density_unit(density_unit)
+    out = arr.astype(np.float32, copy=False)
+    if unit == "g/cc":
+        return out * 1000.0
+    return out
+
+
 def load_config(config_path: str) -> dict:
     """Load YAML config (same style as Seismic/forward_modeling/utils.py)."""
     with open(config_path, "r", encoding="utf-8") as f:
@@ -29,6 +49,8 @@ def load_density_model(config: dict, config_path: str) -> torch.Tensor:
     """
     Load density model as torch.Tensor with shape (nx, ny, nz), float32.
 
+    Returned density is always normalized to kg/m^3 for gravity use.
+
     Supports:
     - .npy: raw numpy array
     - .npz: specify key with model.npz_key (default tries 'density' then first key)
@@ -38,6 +60,7 @@ def load_density_model(config: dict, config_path: str) -> torch.Tensor:
     fpath = _resolve_path(mconf.get("file_path", ""), config_path)
     shape = mconf.get("shape", None)
     npz_key = mconf.get("npz_key", None)
+    density_unit = _normalize_density_unit(mconf.get("density_unit", CANONICAL_DENSITY_UNIT))
 
     if fpath and os.path.exists(fpath):
         ext = os.path.splitext(fpath)[1].lower()
@@ -58,17 +81,25 @@ def load_density_model(config: dict, config_path: str) -> torch.Tensor:
             arr = np.fromfile(fpath, dtype=np.float32).reshape(tuple(shape))
         else:
             raise ValueError(f"Unsupported density model format: {ext}")
-        logger.info(f"Loaded density model: {fpath}, shape={arr.shape}, dtype={arr.dtype}")
+        logger.info(
+            f"Loaded density model: {fpath}, shape={arr.shape}, dtype={arr.dtype}, "
+            f"input_unit={density_unit}"
+        )
     else:
         if shape is None:
             raise FileNotFoundError(f"Density model file not found: {fpath} and model.shape not provided.")
         default_rho = float(mconf.get("default_density", 2670.0))
         arr = np.full(tuple(shape), default_rho, dtype=np.float32)
-        logger.warning(f"Density model not found, using constant density={default_rho} kg/m^3, shape={shape}")
+        logger.warning(
+            f"Density model not found, using constant density={default_rho} {density_unit}, shape={shape}"
+        )
 
     if arr.ndim != 3:
         raise ValueError(f"Density model must be 3D, got shape={arr.shape}")
     # Ensure (nx, ny, nz)
     if shape is not None and tuple(arr.shape) != tuple(shape):
         logger.warning(f"Density shape mismatch: file={arr.shape}, config.shape={shape}. Using file shape.")
+
+    arr = _convert_density_to_kgm3(arr, density_unit)
+    logger.info(f"Density model normalized to {CANONICAL_DENSITY_UNIT} for gravity forward.")
     return torch.from_numpy(arr.astype(np.float32))

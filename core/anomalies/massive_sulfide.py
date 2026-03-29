@@ -496,7 +496,11 @@ class MassiveSulfide(Anomaly):
                     if p.halo_enable and abs(float(p.halo_vp_delta_frac)) > 1e-9:
                         out_slice *= (1.0 + float(p.halo_vp_delta_frac) * m_halo)
                 elif k == 'rho':
-                    prop_core = w_massive * float(p.rho_massive_gcc) + w_ch * float(p.rho_chimney_gcc) + w_sw * float(p.rho_stockwork_gcc)
+                    prop_core = 1000.0 * (
+                        w_massive * float(p.rho_massive_gcc)
+                        + w_ch * float(p.rho_chimney_gcc)
+                        + w_sw * float(p.rho_stockwork_gcc)
+                    )
                     out_slice = (1.0 - w_total) * prop_slice + prop_core
                     if p.halo_enable and abs(float(p.halo_rho_delta_frac)) > 1e-9:
                         out_slice *= (1.0 + float(p.halo_rho_delta_frac) * m_halo)
