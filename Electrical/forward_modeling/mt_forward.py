@@ -1,6 +1,16 @@
+from pathlib import Path
+import sys
+
 import torch
 import torch.nn as nn
-import mt_forward_cuda
+
+try:
+    from . import mt_forward_cuda
+except ImportError:
+    raise ImportError(
+        "Failed to import mt_forward_cuda. Ensure the CUDA MT 3D extension is built and installed correctly. "
+        "Refer to the README for build instructions."
+    ) from None
 
 
 PHOENIX_COEFFS = [8.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0]
@@ -75,20 +85,33 @@ class MTForward3D(nn.Module):
         Args:
             rho_tensor: 3D contiguous tensor of shape (NX, NY, NZ) with resistivity values (Ohm-m).
         Returns:
-            app_res: Apparent resistivity tensor of shape (n_freqs, NX, NY, 2)
-            phase: Phase tensor of shape (n_freqs, NX, NY, 2)
+            app_res: Apparent resistivity tensor of shape (n_freqs, NX, NY, 2),
+                where the last dimension is (Zxy, Zyx). Returned on the same
+                device as `rho_tensor`.
+            phase: Phase tensor of shape (n_freqs, NX, NY, 2),
+                where the last dimension is (Zxy, Zyx). Returned on the same
+                device as `rho_tensor`.
         """
-        # Ensure tensor is CPU, double, and contiguous
-        rho_cpu = rho_tensor.detach().cpu().to(torch.float64).contiguous()
+        input_device = rho_tensor.device
+        rho_prepared = rho_tensor.detach().to(torch.float64)
+        # The original MTForward3D entry path is stable when the extension receives
+        # a CPU tensor and performs its own host/device staging internally. The
+        # newer CUDA-input branch is still less stable in large pipeline calls, so
+        # we keep the public API device-agnostic but normalize the extension input
+        # back to the known-good CPU entry path here.
+        rho_solver_input = rho_prepared.cpu().contiguous()
         if self.freqs:
             freqs = list(self.freqs)
         else:
-            freqs, bg_rho, f_min, f_max = resolve_auto_mt_frequencies(rho_cpu, self.dz)
-            print(f"-> Auto-calculated Background Rho: {bg_rho:.6g} Ohm-m")
-            print("-> Auto-calculated Frequency Range:")
-            print(f"   f_max: {f_max:.6g} Hz, f_min: {f_min:.6g} Hz")
-            print(f"   Range: [{freqs[0]:.6g} Hz  ...  {freqs[-1]:.6g} Hz], Points = {len(freqs)}")
+            freqs, bg_rho, f_min, f_max = resolve_auto_mt_frequencies(rho_solver_input, self.dz)
 
         self.last_freqs = tuple(freqs)
-        app_res, phase = mt_forward_cuda.compute_mt_3d(rho_cpu, self.dx, self.dy, self.dz, freqs)
+        app_res, phase = mt_forward_cuda.compute_mt_3d(rho_solver_input, self.dx, self.dy, self.dz, freqs)
+        if input_device.type != "cpu":
+            app_res = app_res.to(input_device)
+            phase = phase.to(input_device)
+        # The custom CUDA extension does not surface all launch errors immediately.
+        # Synchronize here so failures are attributed to MT instead of a later torch call.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         return app_res, phase

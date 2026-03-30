@@ -2,6 +2,7 @@
 #ifndef BOUNDARYCONDITIONS3D_H
 #define BOUNDARYCONDITIONS3D_H
 
+#include <cuComplex.h>
 #include "mesh3d.h"
 #include <vector>
 #include <complex>
@@ -26,5 +27,11 @@ void applyBoundaryConditions3D(const HostMesh3D &mesh, double freq, double rho_b
                                std::vector<std::complex<double>> &b,
                                int polarization,
                                const BoundaryConditionPlan* plan = nullptr);
+
+void applyBoundaryConditions3DDevice(double freq, double rho_bg,
+                                     cuDoubleComplex* d_csrVal,
+                                     cuDoubleComplex* d_b,
+                                     int polarization,
+                                     const BoundaryConditionPlan* plan);
 
 #endif // BOUNDARYCONDITIONS3D_H

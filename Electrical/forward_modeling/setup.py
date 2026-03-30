@@ -13,6 +13,7 @@ setup(
             'src/gpuComplexSolver.cu',
             'src/gpuIterativeSolver.cu',
             'src/gpuAssemble3d.cu',
+            'src/gpuBoundaryPostprocess.cu',
         ],
         extra_compile_args={'cxx': ['-O3', '-std=c++17'], 'nvcc': ['-O3', '--use_fast_math', '-std=c++17']},
         libraries=['cusolver', 'cusparse', 'cublas', 'cudart'])

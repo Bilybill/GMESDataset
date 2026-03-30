@@ -1,9 +1,10 @@
+import argparse
 import os
 import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from mt_forward import MTForward3D
+from mt_forward import MTForward3D, _generate_phoenix_frequencies
 
 
 def print_cuda_diagnostics():
@@ -21,11 +22,31 @@ def print_cuda_diagnostics():
         print("  warning: no visible CUDA device. If forward runs, it will not have a valid GPU solver context.")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run MT forward modeling and plotting with an optional frequency range.")
+    parser.add_argument(
+        "--freq-min",
+        type=float,
+        default=None,
+        help="Minimum frequency in Hz. Must be used together with --freq-max.",
+    )
+    parser.add_argument(
+        "--freq-max",
+        type=float,
+        default=None,
+        help="Maximum frequency in Hz. Must be used together with --freq-min.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    filepath = '/home/wangyh/Project/GMESUni/MTForward3D/MTModel/em_model_3d_50x30x50.bin'
+    args = parse_args()
+    filepath = '/home/wangyh/Project/GMESUni/GMESDataset/DATAFOLDER/Cache/ForwardOutput/downsampled_mt_model_50x50x50.bin'
     
-    NX, NY, NZ = 50, 30, 50
-    dx, dy, dz = 160.0, 160.0, 80.0
+    # NX, NY, NZ = 50, 30, 50
+    # dx, dy, dz = 160.0, 160.0, 80.0
+    NX, NY, NZ = 50, 50, 50
+    dx, dy, dz = 51, 51, 128
 
     print_cuda_diagnostics()
 
@@ -35,9 +56,22 @@ if __name__ == "__main__":
 
     # In the binary file, X changes fastest, then Y, then Z. (from C++ elemIdx = i + j*NX + k*NX*NY)
     # Numpy's shape (NZ, NY, NX) correctly maps to this memory layout.
-    rho_tensor = torch.from_numpy(data.astype(np.float64)).view(NZ, NY, NX).permute(2, 1, 0).contiguous()
+    rho_tensor = torch.from_numpy(data.astype(np.float64)).view(NZ, NY, NX).permute(2, 1, 0).contiguous() # shape (NX, NY, NZ)
 
-    operator = MTForward3D(None, dx, dy, dz)
+    user_freqs = None
+    if args.freq_min is not None or args.freq_max is not None:
+        if args.freq_min is None or args.freq_max is None:
+            raise ValueError("--freq-min and --freq-max must be provided together.")
+        if args.freq_min <= 0.0 or args.freq_max <= 0.0:
+            raise ValueError("--freq-min and --freq-max must both be positive.")
+        user_freqs = _generate_phoenix_frequencies(args.freq_min, args.freq_max)
+        print(
+            "Using user-specified frequency range: "
+            f"[{min(args.freq_min, args.freq_max)} Hz ... {max(args.freq_min, args.freq_max)} Hz], "
+            f"generated {len(user_freqs)} Phoenix frequencies."
+        )
+
+    operator = MTForward3D(user_freqs, dx, dy, dz)
     
     # ==========================================
     # Run MT 3D Forward (Single GPU Original Version)
@@ -46,13 +80,16 @@ if __name__ == "__main__":
     print(f"🚀 Running Single-GPU Execution")
     print("====================================")
     start_multi = time.time()
-    
+    print(f"Input resistivity tensor shape: {rho_tensor.shape}, dtype: {rho_tensor.dtype}")
     app_res_multi, phase_multi = operator(rho_tensor)
     end_multi = time.time()
     time_multi = end_multi - start_multi
     freqs = list(operator.last_freqs)
     print(f"✅ Executed 3D MT Forward in: {time_multi:.2f} s")
-    print(f"Auto-selected {len(freqs)} frequencies.")
+    if user_freqs is None:
+        print(f"Auto-selected {len(freqs)} frequencies.")
+    else:
+        print(f"Using {len(freqs)} user-constrained frequencies.")
     
     # ==========================================
     # Visualization
@@ -61,8 +98,8 @@ if __name__ == "__main__":
     print("📊 Generating Visualizations...")
     print("====================================")
     
-    app_res = app_res_multi.numpy()    # (n_freqs, NX, NY, 2)
-    phase = phase_multi.numpy()        # (n_freqs, NX, NY, 2)
+    app_res = app_res_multi.detach().cpu().numpy()    # (n_freqs, NX, NY, 2)
+    phase = phase_multi.detach().cpu().numpy()        # (n_freqs, NX, NY, 2)
     freqs_np = np.array(freqs)
     
     x_coords = (np.arange(NX) + 0.5) * dx

@@ -5,11 +5,30 @@
 #include <iostream>
 
 // 1. 针对 double 类型的复数原子加法 (CUDA 原生只有 float 版本的复数原子加)
-__device__ void atomicAddComplex(cuDoubleComplex* address, cuDoubleComplex val) {
+static __device__ __forceinline__ double atomicAddDoubleCompat(double* address, double val) {
+#if __CUDA_ARCH__ >= 600
+    return atomicAdd(address, val);
+#else
+    unsigned long long int* addressAsUll = reinterpret_cast<unsigned long long int*>(address);
+    unsigned long long int old = *addressAsUll;
+    unsigned long long int assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(
+            addressAsUll,
+            assumed,
+            __double_as_longlong(val + __longlong_as_double(assumed))
+        );
+    } while (assumed != old);
+    return __longlong_as_double(old);
+#endif
+}
+
+static __device__ __forceinline__ void atomicAddComplex(cuDoubleComplex* address, cuDoubleComplex val) {
     double* realAddr = (double*)address;
     double* imagAddr = realAddr + 1;
-    atomicAdd(realAddr, cuCreal(val));
-    atomicAdd(imagAddr, cuCimag(val));
+    atomicAddDoubleCompat(realAddr, cuCreal(val));
+    atomicAddDoubleCompat(imagAddr, cuCimag(val));
 }
 
 // 2. 将 CPU 的 computeLocalMatrix3D 移植为设备函数

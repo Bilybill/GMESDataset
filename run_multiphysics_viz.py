@@ -44,7 +44,7 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
     
     # 保存与可视化准备
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    save_dir = os.path.join(base_dir, "DATAFOLDER", "Cache/", "Fig")
+    save_dir = os.path.join(base_dir, "DATAFOLDER", "Cache/", "ModelFig/")
     os.makedirs(save_dir, exist_ok=True)
     
     # 磁化率放大数值便于可视化
@@ -54,13 +54,27 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
     def _safe_clim(vmin, vmax, eps=1e-5):
         return [vmin, vmax] if vmax > vmin else [vmin, vmax + eps]
 
+    def _robust_upper_clim(values, upper_pct=99.5):
+        arr = np.asarray(values, dtype=np.float32)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return _safe_clim(0.0, 1.0)
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+        robust_vmax = float(np.percentile(finite, upper_pct))
+        robust_vmax = max(robust_vmax, vmin + 1e-5)
+        return _safe_clim(vmin, min(vmax, robust_vmax))
+
     clim_vp = _safe_clim(vp_multi.min(), vp_multi.max())
     clim_rho = _safe_clim(rho_multi.min(), rho_multi.max())
     
     log_res_multi = np.log10(np.clip(res_multi, a_min=1e-5, a_max=None))
     # 电阻率跨度极大，往往取对数以保证可视化效果
     clim_res = _safe_clim(log_res_multi.min(), log_res_multi.max())
-    clim_chi = _safe_clim(chi_multi_scaled.min(), chi_multi_scaled.max())
+    # Susceptibility often contains a tiny high-chi ore body inside a much larger
+    # weakly magnetic background. A robust upper percentile keeps that anomaly
+    # visible instead of letting a few extreme cells flatten the whole panel.
+    clim_chi = _robust_upper_clim(chi_multi_scaled, upper_pct=99.5)
 
     # 在四个子窗口分别创建模型基础切片
     nodes_vp = cigvis.create_slices(vp_multi, cmap='jet', clim=clim_vp)

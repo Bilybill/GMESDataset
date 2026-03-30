@@ -147,3 +147,29 @@ void femAssemble3D_Matrix(const HostMesh3D &mesh, double freq, const std::vector
 
     complexTripletToCSR3D(mesh.NEdges, triplets, csrRowPtr, csrColInd, csrVal);
 }
+
+void femBuild3D_CSRStructure(const HostMesh3D &mesh,
+                             std::vector<int> &csrColInd,
+                             std::vector<int> &csrRowPtr)
+{
+    std::vector<ComplexTriple> triplets;
+    triplets.reserve(static_cast<size_t>(mesh.NE) * 144);
+
+    for (int h = 0; h < mesh.NE; ++h) {
+        int globalEdges[12];
+        for (int e = 0; e < 12; ++e) {
+            globalEdges[e] = mesh.ME_Edges[12 * h + e];
+        }
+
+        for (int i = 0; i < 12; ++i) {
+            int row = globalEdges[i];
+            for (int j = 0; j < 12; ++j) {
+                int col = globalEdges[j];
+                triplets.push_back({row, col, std::complex<double>(1.0, 0.0)});
+            }
+        }
+    }
+
+    std::vector<std::complex<double>> dummyVals;
+    complexTripletToCSR3D(mesh.NEdges, triplets, csrRowPtr, csrColInd, dummyVals);
+}

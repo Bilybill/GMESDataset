@@ -16,8 +16,12 @@ class ElectricalForwardSolver(BaseForwardSolver):
         Args:
             rho_tensor: 3D contiguous tensor of shape (NX, NY, NZ) with resistivity values (Ohm-m).
         Returns:
-            app_res: Apparent resistivity tensor of shape (n_freqs, NX, NY, 2)
-            phase: Phase tensor of shape (n_freqs, NX, NY, 2)
+            app_res: Apparent resistivity tensor of shape (n_freqs, NX, NY, 2),
+                where the last dimension is (Zxy, Zyx). Returned on the same
+                device as `rho_tensor`.
+            phase: Phase tensor of shape (n_freqs, NX, NY, 2),
+                where the last dimension is (Zxy, Zyx). Returned on the same
+                device as `rho_tensor`.
         """
         return self.solver(rho_tensor)
 

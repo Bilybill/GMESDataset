@@ -313,10 +313,15 @@ class MassiveSulfideParams:
     resist_stockwork_ohmm: float = 10.0
     halo_resist_delta_frac: float = -0.2
     
-    chi_massive_si: float = 0.05
-    chi_chimney_si: float = 0.02
-    chi_stockwork_si: float = 0.005
+    # A joint-display friendly magnetic scheme:
+    # keep the massive core strongest, but also let chimney / stockwork / halo
+    # carry a broader magnetic signature so gravity-magnetic-EM-seismic overlays
+    # do not collapse into a tiny magnetic hotspot only.
+    chi_massive_si: float = 0.012
+    chi_chimney_si: float = 0.006
+    chi_stockwork_si: float = 0.0018
     halo_chi_delta_frac: float = 0.0
+    halo_chi_add_si: float = 5.0e-4
 
     # --- smoothing / edges ---
     edge_width_m: float = 25.0
@@ -509,6 +514,8 @@ class MassiveSulfide(Anomaly):
                     out_slice = (1.0 - w_total) * prop_slice + prop_core
                     if p.halo_enable and abs(float(p.halo_chi_delta_frac)) > 1e-9:
                         out_slice *= (1.0 + float(p.halo_chi_delta_frac) * m_halo)
+                    if p.halo_enable and abs(float(getattr(p, 'halo_chi_add_si', 0.0))) > 1e-9:
+                        out_slice += float(p.halo_chi_add_si) * m_halo
                 elif k == 'resist':
                     # Use logarithmic/Archie-like mixing for conductivity (log(resist) blending)
                     log_bg = np.log10(np.clip(prop_slice, 1e-3, 1e6))

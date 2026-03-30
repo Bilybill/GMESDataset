@@ -17,6 +17,10 @@ void femAssemble3D_Matrix(const HostMesh3D &mesh, double freq, const std::vector
                           std::vector<int> &csrColInd, 
                           std::vector<int> &csrRowPtr);
 
+void femBuild3D_CSRStructure(const HostMesh3D &mesh,
+                             std::vector<int> &csrColInd,
+                             std::vector<int> &csrRowPtr);
+
 void complexTripletToCSR3D(int N, const std::vector<ComplexTriple> &triplets,
                            std::vector<int> &csrRowPtr, 
                            std::vector<int> &csrColInd, 

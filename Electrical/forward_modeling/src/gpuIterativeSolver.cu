@@ -17,6 +17,7 @@ struct GpuBiCGStabContext {
     cusparseHandle_t cusparseH = nullptr;
     int *d_csrRowPtr = nullptr;
     int *d_csrColInd = nullptr;
+    int *d_diagonalIndices = nullptr;
     cuDoubleComplex *d_csrVal = nullptr;
     cuDoubleComplex *d_b = nullptr;
     cuDoubleComplex *d_x = nullptr;
@@ -41,6 +42,29 @@ __global__ void complexElementWiseMul(int n, const cuDoubleComplex* a, const cuD
     }
 }
 
+__global__ void computeJacobiInverseKernel(int n,
+                                           const int* diagonalIndices,
+                                           const cuDoubleComplex* csrVal,
+                                           cuDoubleComplex* Minv) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+
+    int diagIndex = diagonalIndices[idx];
+    cuDoubleComplex diag = make_cuDoubleComplex(1.0, 0.0);
+    if (diagIndex >= 0) {
+        diag = csrVal[diagIndex];
+    }
+
+    double mag_sq = cuCreal(diag) * cuCreal(diag) + cuCimag(diag) * cuCimag(diag);
+    if (mag_sq > 1e-30) {
+        Minv[idx] = make_cuDoubleComplex(cuCreal(diag) / mag_sq, -cuCimag(diag) / mag_sq);
+    } else {
+        Minv[idx] = make_cuDoubleComplex(1.0, 0.0);
+    }
+}
+
 inline cuDoubleComplex to_cuDoubleComplex(const std::complex<double>& c) {
     return make_cuDoubleComplex(c.real(), c.imag());
 }
@@ -57,6 +81,7 @@ GpuBiCGStabContext* allocate_context(int N, int nnz) {
 
     cudaMalloc((void**)&context->d_csrRowPtr, (N + 1) * sizeof(int));
     cudaMalloc((void**)&context->d_csrColInd, nnz * sizeof(int));
+    cudaMalloc((void**)&context->d_diagonalIndices, N * sizeof(int));
     cudaMalloc((void**)&context->d_csrVal, nnz * sizeof(cuDoubleComplex));
     cudaMalloc((void**)&context->d_b, N * sizeof(cuDoubleComplex));
     cudaMalloc((void**)&context->d_x, N * sizeof(cuDoubleComplex));
@@ -95,6 +120,7 @@ void free_context(GpuBiCGStabContext* context) {
 
     cudaFree(context->d_csrRowPtr);
     cudaFree(context->d_csrColInd);
+    cudaFree(context->d_diagonalIndices);
     cudaFree(context->d_csrVal);
     cudaFree(context->d_b);
     cudaFree(context->d_x);
@@ -150,72 +176,25 @@ void initialize_structure_if_needed(GpuBiCGStabContext* context,
             }
         }
     }
+    cudaMemcpy(context->d_diagonalIndices, context->diagonalIndices.data(),
+               context->N * sizeof(int), cudaMemcpyHostToDevice);
     context->structureInitialized = true;
 }
 
-} // namespace
-
-GpuBiCGStabContext* create_gpu_bicgstab_context(int N, int nnz)
+bool solve_bicgstab_in_context(GpuBiCGStabContext* context,
+                               double tol,
+                               int maxIter,
+                               SolverStats* stats)
 {
-    return allocate_context(N, nnz);
-}
-
-void destroy_gpu_bicgstab_context(GpuBiCGStabContext* context)
-{
-    free_context(context);
-}
-
-bool gpu_complex_solver_bicgstab(int N,
-                                 const std::vector<int> &h_csrRowPtr,
-                                 const std::vector<int> &h_csrColInd,
-                                 const std::vector<std::complex<double>> &h_csrVal,
-                                 const std::vector<std::complex<double>> &h_b,
-                                 std::vector<std::complex<double>> &x,
-                                 double tol,
-                                 int maxIter,
-                                 GpuBiCGStabContext* context,
-                                 SolverStats* stats)
-{
-    int nnz = static_cast<int>(h_csrVal.size());
-    validate_context(context, N, nnz);
-    bool ownsContext = false;
-    if (!context) {
-        context = allocate_context(N, nnz);
-        ownsContext = true;
-    }
-
     if (stats) {
         *stats = SolverStats{};
     }
 
-    initialize_structure_if_needed(context, h_csrRowPtr, h_csrColInd);
+    int N = context->N;
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
 
-    std::vector<cuDoubleComplex> h_M_inv(N);
-    for (int i = 0; i < N; ++i) {
-        cuDoubleComplex diag = make_cuDoubleComplex(1.0, 0.0);
-        int diagIndex = context->diagonalIndices[i];
-        if (diagIndex >= 0) {
-            diag = to_cuDoubleComplex(h_csrVal[diagIndex]);
-        }
-        double mag_sq = cuCreal(diag) * cuCreal(diag) + cuCimag(diag) * cuCimag(diag);
-        if (mag_sq > 1e-30) {
-            h_M_inv[i] = make_cuDoubleComplex(cuCreal(diag) / mag_sq, -cuCimag(diag) / mag_sq);
-        } else {
-            h_M_inv[i] = make_cuDoubleComplex(1.0, 0.0);
-        }
-    }
-
-    std::vector<cuDoubleComplex> c_csrVal(nnz), c_b(N), c_x(N);
-    for (int i = 0; i < nnz; i++) c_csrVal[i] = to_cuDoubleComplex(h_csrVal[i]);
-    for (int i = 0; i < N; i++) {
-        c_b[i] = to_cuDoubleComplex(h_b[i]);
-        c_x[i] = to_cuDoubleComplex(x[i]);
-    }
-
-    cudaMemcpy(context->d_csrVal, c_csrVal.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
-    cudaMemcpy(context->d_b, c_b.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
-    cudaMemcpy(context->d_x, c_x.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
-    cudaMemcpy(context->d_Minv, h_M_inv.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    computeJacobiInverseKernel<<<blocks, threads>>>(N, context->d_diagonalIndices, context->d_csrVal, context->d_Minv);
 
     cuDoubleComplex alpha_c = make_cuDoubleComplex(1.0, 0.0);
     cuDoubleComplex beta_c  = make_cuDoubleComplex(0.0, 0.0);
@@ -224,14 +203,18 @@ bool gpu_complex_solver_bicgstab(int N,
         cusparseDnVecDescr_t vIn, vOut;
         cusparseCreateDnVec(&vIn, N, in, CUDA_C_64F);
         cusparseCreateDnVec(&vOut, N, out, CUDA_C_64F);
-        cusparseSpMV(context->cusparseH, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_c, context->matA, vIn, &beta_c, vOut, CUDA_C_64F, CUSPARSE_SPMV_ALG_DEFAULT, context->dBuffer);
+        cusparseSpMV(context->cusparseH, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                     &alpha_c, context->matA, vIn, &beta_c, vOut,
+                     CUDA_C_64F, CUSPARSE_SPMV_ALG_DEFAULT, context->dBuffer);
         cusparseDestroyDnVec(vIn);
         cusparseDestroyDnVec(vOut);
     };
 
     double norm_b, res_norm;
     cublasDznrm2(context->cublasH, N, context->d_b, 1, &norm_b);
-    if (norm_b == 0.0) norm_b = 1.0;
+    if (norm_b == 0.0) {
+        norm_b = 1.0;
+    }
 
     cuDoubleComplex rho_prev = make_cuDoubleComplex(1.0, 0.0);
     cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
@@ -258,18 +241,8 @@ bool gpu_complex_solver_bicgstab(int N,
             stats->finalResidual = res_norm / norm_b;
             stats->converged = true;
         }
-        cudaMemcpy(c_x.data(), context->d_x, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
-        for (int i = 0; i < N; i++) {
-            x[i] = std::complex<double>(cuCreal(c_x[i]), cuCimag(c_x[i]));
-        }
-        if (ownsContext) {
-            free_context(context);
-        }
         return true;
     }
-
-    int threads = 256;
-    int blocks = (N + threads - 1) / threads;
 
     int iter = 0;
     bool converged = false;
@@ -278,7 +251,9 @@ bool gpu_complex_solver_bicgstab(int N,
         cuDoubleComplex rho;
         cublasZdotu(context->cublasH, N, context->d_r0_hat, 1, context->d_r, 1, &rho);
 
-        if (cuCabs(rho) < 1e-30) break;
+        if (cuCabs(rho) < 1e-30) {
+            break;
+        }
 
         cuDoubleComplex beta = cuCmul(cuCdiv(rho, rho_prev), cuCdiv(alpha, omega));
 
@@ -293,7 +268,9 @@ bool gpu_complex_solver_bicgstab(int N,
 
         cuDoubleComplex r0_v;
         cublasZdotu(context->cublasH, N, context->d_r0_hat, 1, context->d_v, 1, &r0_v);
-        if (cuCabs(r0_v) < 1e-30) break;
+        if (cuCabs(r0_v) < 1e-30) {
+            break;
+        }
         alpha = cuCdiv(rho, r0_v);
 
         cudaMemcpy(context->d_s, context->d_r, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
@@ -313,7 +290,9 @@ bool gpu_complex_solver_bicgstab(int N,
         cuDoubleComplex ts, tt;
         cublasZdotc(context->cublasH, N, context->d_t, 1, context->d_s, 1, &ts);
         cublasZdotc(context->cublasH, N, context->d_t, 1, context->d_t, 1, &tt);
-        if (cuCabs(tt) < 1e-30) break;
+        if (cuCabs(tt) < 1e-30) {
+            break;
+        }
         omega = cuCdiv(ts, tt);
 
         cublasZaxpy(context->cublasH, N, &alpha, context->d_yp, 1, context->d_x, 1);
@@ -347,6 +326,109 @@ bool gpu_complex_solver_bicgstab(int N,
         stats->finalResidual = res_norm / norm_b;
         stats->converged = converged;
     }
+
+    return converged;
+}
+
+} // namespace
+
+GpuBiCGStabContext* create_gpu_bicgstab_context(int N, int nnz)
+{
+    return allocate_context(N, nnz);
+}
+
+void destroy_gpu_bicgstab_context(GpuBiCGStabContext* context)
+{
+    free_context(context);
+}
+
+void initialize_gpu_bicgstab_structure(GpuBiCGStabContext* context,
+                                       const std::vector<int> &h_csrRowPtr,
+                                       const std::vector<int> &h_csrColInd)
+{
+    validate_context(context, static_cast<int>(h_csrRowPtr.size()) - 1, static_cast<int>(h_csrColInd.size()));
+    initialize_structure_if_needed(context, h_csrRowPtr, h_csrColInd);
+}
+
+const int* get_gpu_bicgstab_row_ptr_device(const GpuBiCGStabContext* context)
+{
+    return context->d_csrRowPtr;
+}
+
+const int* get_gpu_bicgstab_col_ind_device(const GpuBiCGStabContext* context)
+{
+    return context->d_csrColInd;
+}
+
+cuDoubleComplex* get_gpu_bicgstab_matrix_values_device(GpuBiCGStabContext* context)
+{
+    return context->d_csrVal;
+}
+
+cuDoubleComplex* get_gpu_bicgstab_rhs_device(GpuBiCGStabContext* context)
+{
+    return context->d_b;
+}
+
+bool gpu_complex_solver_bicgstab_device(GpuBiCGStabContext* context,
+                                        cuDoubleComplex* d_x_io,
+                                        double tol,
+                                        int maxIter,
+                                        SolverStats* stats)
+{
+    if (!context) {
+        throw std::runtime_error("GpuBiCGStabContext is required for device solve");
+    }
+    if (!context->structureInitialized) {
+        throw std::runtime_error("GpuBiCGStabContext structure must be initialized before device solve");
+    }
+
+    if (d_x_io != context->d_x) {
+        cudaMemcpy(context->d_x, d_x_io, context->N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
+    }
+    bool ok = solve_bicgstab_in_context(context, tol, maxIter, stats);
+    if (d_x_io != context->d_x) {
+        cudaMemcpy(d_x_io, context->d_x, context->N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
+    }
+    return ok;
+}
+
+bool gpu_complex_solver_bicgstab(int N,
+                                 const std::vector<int> &h_csrRowPtr,
+                                 const std::vector<int> &h_csrColInd,
+                                 const std::vector<std::complex<double>> &h_csrVal,
+                                 const std::vector<std::complex<double>> &h_b,
+                                 std::vector<std::complex<double>> &x,
+                                 double tol,
+                                 int maxIter,
+                                 GpuBiCGStabContext* context,
+                                 SolverStats* stats)
+{
+    int nnz = static_cast<int>(h_csrVal.size());
+    validate_context(context, N, nnz);
+    bool ownsContext = false;
+    if (!context) {
+        context = allocate_context(N, nnz);
+        ownsContext = true;
+    }
+
+    if (stats) {
+        *stats = SolverStats{};
+    }
+
+    initialize_structure_if_needed(context, h_csrRowPtr, h_csrColInd);
+
+    std::vector<cuDoubleComplex> c_csrVal(nnz), c_b(N), c_x(N);
+    for (int i = 0; i < nnz; i++) c_csrVal[i] = to_cuDoubleComplex(h_csrVal[i]);
+    for (int i = 0; i < N; i++) {
+        c_b[i] = to_cuDoubleComplex(h_b[i]);
+        c_x[i] = to_cuDoubleComplex(x[i]);
+    }
+
+    cudaMemcpy(context->d_csrVal, c_csrVal.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    cudaMemcpy(context->d_b, c_b.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    cudaMemcpy(context->d_x, c_x.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    bool converged = solve_bicgstab_in_context(context, tol, maxIter, stats);
 
     cudaMemcpy(c_x.data(), context->d_x, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
     for (int i = 0; i < N; i++) {

@@ -11,8 +11,8 @@
    - `forward_magnetic.npy`: 二维数组 (nx, ny)，单位 nT。
 
 3. **电磁 (MT)**:
-   - `forward_mt_app_res.npy`: 视电阻率张量，如 4 维 (N_freq, nx, ny, 2 [ex/ey])。
-   - `forward_mt_phase.npy`: 相位张量。
+   - `forward_mt_app_res.npy`: 视电阻率张量，如 4 维 `(N_freq, nx, ny, 2 [Zxy/Zyx])`。
+   - `forward_mt_phase.npy`: 相位张量，最后一维同样对应 `(Zxy/Zyx)`。
 
 4. **地震 (*.npy)**:
    - `forward_seismic.npy`: 2D slice 共炮点记录记录，形如 (N_shot, N_receiver, N_time)。
