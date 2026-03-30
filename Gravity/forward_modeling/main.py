@@ -38,7 +38,7 @@ def main():
 
     # Load density model
     rho = load_density_model(config, args.config).to(device)
-    logger.info("Gravity density unit normalized to kg/m^3 before forward modeling.")
+    logger.info("Gravity density input normalized to g/cm^3; solver converts internally to kg/m^3.")
 
     # Grid spacing
     mconf = config.get("model", {})
@@ -65,7 +65,7 @@ def main():
         G=G,
         output_unit=output_unit,
         pad_factor=pad_factor,
-        density_unit="kg/m^3",
+        density_unit="g/cm^3",
     )
     t1 = time.time()
     logger.info(f"Forward done. Output shape={tuple(data.shape)}. Time={(t1 - t0):.2f}s")

@@ -15,7 +15,7 @@ except ImportError:
     segyio = None
     print("Warning: segyio not found. Using synthetic background.")
 
-from core.builder import DatasetBuilder
+from core.multiphysics import build_multiphysics_model
 from core.anomalies.igneous_intrusion import IgneousIntrusion, IgneousIntrusionParams
 from core.anomalies.massive_sulfide import MassiveSulfide, MassiveSulfideParams
 from core.anomalies.hydrocarbon_hydrate import HydrocarbonHydrate, HydrocarbonHydrateParams
@@ -42,13 +42,31 @@ def read_segy_volume(path):
     dx, dy, dz = 1.0, 1.0, 1.0
     return vol, (dx, dy, dz)
 
+
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 def main():
     print("=== GMESDataset Igneous Intrusion Demo (Swarm & Stock) ===")
-    DATA_PREFIX = "/home/wyh/wyhHDD/Project/3DSeismic/AYLModel/3DExample"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    DATA_PREFIX = os.path.expanduser(
+        os.environ.get(
+            "GMESDATASET_DATA_PREFIX",
+            "/home/wyh/wyhHDD/Project/3DSeismic/AYLModel/3DExample",
+        )
+    )
     # Configuration for external SEGY files
     vp_segy_path = os.path.join(DATA_PREFIX, "Velocity_choas/braided/AYL-00000.sgy")
     label_segy_path = os.path.join(DATA_PREFIX, "Layer_choas/braided/AYL-00000.sgy")
-    SAVE_PREFIX = "/home/wyh/wyhHDD/Project/3DSeismic/Cache"
+    SAVE_PREFIX = os.path.expanduser(
+        os.environ.get(
+            "GMESDATASET_SAVE_PREFIX",
+            os.path.join(script_dir, "outputs", "run_demo"),
+        )
+    )
     
     use_segy = segyio is not None and os.path.exists(vp_segy_path) and os.path.exists(label_segy_path)
 
@@ -84,9 +102,6 @@ def main():
         label_vol[:, :, 120:160] = 3
 
     print(f"   Background Vp range: {vp_bg.min():.1f} - {vp_bg.max():.1f} m/s")
-
-    # 2. Initialize the Builder
-    builder = DatasetBuilder(dx, dy, dz)
 
     # 3. Define Anomalies
     anomalies = []
@@ -241,63 +256,38 @@ def main():
     serp = SerpentinizedZone(params=serp_params, layer_labels=label_vol)
     anomalies.append(serp)
 
-    # Manual Rho Demo
-    print("   [Demo] Generating Multi-Physics Models (Rho, Res, Chi) via SBI...")
-    nx, ny, nz = vp_bg.shape
-    x = np.arange(nx) * dx
-    y = np.arange(ny) * dy
-    z = np.arange(nz) * dz
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    # Apply basin-scale background modifiers before local anomalies.
+    anomalies = sorted(anomalies, key=lambda a: 0 if getattr(a, "type", "") == "sediment_basement" else 1)
 
-    # SBI can generate full property models
-    # Note: build_property_models needs X,Y,Z. 
-    # Since builder only updates Vp, we verify properties separately here.
+    print("3. Injecting anomalies into multi-physics model...")
+    models = build_multiphysics_model(vp_bg, label_vol, anomalies, dx, dy, dz)
+    vp_final = models["vp"]
+    rho_final = models["rho"]
+    res_final = models["resist"]
+    chi_final = models["chi"]
+    X, Y, Z = models["X"], models["Y"], models["Z"]
+    anomaly_label = models["anomaly_label"]
+
+    print(f"   Final Vp range : {vp_final.min():.1f} - {vp_final.max():.1f} m/s")
+    print(f"   Final Rho range: {rho_final.min():.2f} - {rho_final.max():.2f} g/cm^3")
+    print(f"   Final Res range: {res_final.min():.2f} - {res_final.max():.2f} Ohm.m")
+    print(f"   Final Chi range: {chi_final.min():.4f} - {chi_final.max():.4f} SI")
+
+    # Auxiliary SBI model for subtype / interface visualization.
+    print("   [Demo] Generating SBI auxiliary property model...")
     multi_props = sbi.build_property_models(X, Y, Z, vp_bg=vp_bg)
-    rho_sbi = multi_props["rho_kgm3"]
+    rho_sbi = multi_props["rho"]
     res_sbi = multi_props["resist_ohmm"]
     chi_sbi = multi_props["chi_SI"]
     facies_sbi = multi_props["facies_label"]
 
     print(f"   SBI Properties Generated:")
-    print(f"     Rho range: {rho_sbi.min():.2f} - {rho_sbi.max():.2f} kg/m^3")
+    print(f"     Rho range: {rho_sbi.min():.2f} - {rho_sbi.max():.2f} g/cm^3")
     print(f"     Res range: {res_sbi.min():.2f} - {res_sbi.max():.2f} Ohm.m")
     print(f"     Chi range: {chi_sbi.min():.4f} - {chi_sbi.max():.4f} SI")
 
-    # Combine Brine Fault Rho into the SBI background (simple overwrite for demo)
-    # Real pipeline would merge them carefully.
-    # rho_final = anom_brine.apply_to_resistivity(res_sbi, X, Y, Z) 
-    # (Note: anom_brine logic expects Rho to be resistivity? Method name is apply_to_resistivity.
-    #  Let's treat res_sbi as the resistivity background for brine fault)
-    res_final = anom_brine.apply_to_resistivity(res_sbi, X, Y, Z)
-
-
-
-    # # Generate grid for debug only
-    # nx, ny, nz = vp_bg.shape
-    # x = np.arange(nx) * dx
-    # y = np.arange(ny) * dy
-    # z = np.arange(nz) * dz
-    # X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-
-    # pre = anom_hyd._precompute(X, Y, Z)  # 临时调试
-    # print("hydrate picked layer_id =", pre["layer_id"])
-    # if pre.get("anchor_ok") is not None:
-    #     print("anchor_ok coverage =", pre["anchor_ok"].mean())
-    # print("z_c min/max =", np.nanmin(pre["z_c"]), np.nanmax(pre["z_c"]))
-
-    # 4. Inject Anomalies
-    print("3. Injecting anomalies into Vp model...")
-    vp_final, mask_final, _, _, _ = builder.inject_anomalies(vp_bg, anomalies)
-
-    print(f"   Final Vp min/max: {vp_final.min():.1f} / {vp_final.max():.1f}")
-
     # --- Generate Subtype Labels for HC/Hydrate Anomaly & Save Models ---
     print("   Generating fine-grained subtype labels for Hydrocarbon/Hydrate...")
-    nx, ny, nz = vp_bg.shape
-    x = np.arange(nx) * dx
-    y = np.arange(ny) * dy
-    z = np.arange(nz) * dz
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
 
     # We have anom_gas and anom_hyd. Let's merge their labels for visualization.
     # Note: If they overlap, one will overwrite the other in this simple merge.
@@ -348,15 +338,25 @@ def main():
     print(f"   Saving models to {SAVE_PREFIX}...")
     try:
         np.save(os.path.join(SAVE_PREFIX, "vp_final.npy"), vp_final)
-        np.save(os.path.join(SAVE_PREFIX, "rho_final.npy"), rho_sbi)
+        np.save(os.path.join(SAVE_PREFIX, "rho_final.npy"), rho_final)
         np.save(os.path.join(SAVE_PREFIX, "res_final.npy"), res_final)
-        np.save(os.path.join(SAVE_PREFIX, "chi_final.npy"), chi_sbi)
+        np.save(os.path.join(SAVE_PREFIX, "chi_final.npy"), chi_final)
         np.save(os.path.join(SAVE_PREFIX, "label_final.npy"), merged_sub)
+        np.save(os.path.join(SAVE_PREFIX, "anomaly_label.npy"), anomaly_label)
         print("   Models saved successfully.")
     except Exception as e:
         print(f"   Error saving models: {e}")
 
     
+    enable_visualization = env_flag("GMESDATASET_ENABLE_VIS", default=False)
+    if not enable_visualization:
+        print("4. Skipping visualization. Set GMESDATASET_ENABLE_VIS=1 to enable interactive plotting.")
+        return
+
+    if cigvis is None:
+        print("4. Skipping visualization because cigvis is not installed.")
+        return
+
     # 5. Visualization with CigVis
     print("4. Visualizing result...")
     

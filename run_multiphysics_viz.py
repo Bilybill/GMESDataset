@@ -8,8 +8,7 @@ import matplotlib.colors as mcolors
 
 import cigvis
 
-from core.builder import DatasetBuilder
-from core.petrophysics.rock_physics import PetrophysicsConverter
+from core.multiphysics import build_multiphysics_model
 from core.anomalies.igneous_intrusion import IgneousIntrusion, IgneousIntrusionParams
 from core.anomalies.hydrocarbon_hydrate import HydrocarbonHydrate, HydrocarbonHydrateParams
 from core.anomalies.brine_fault_zone import BrineFaultZone, BrineFaultZoneParams
@@ -35,25 +34,13 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
     """
     print(f"\n-> Generating Multiphysics for {name_zh} ({anomaly_type_str})...")
     
-    # 1. 实例化转换器并生成具备层面约束的动态背景
-    converter = PetrophysicsConverter()
-    rho_bg, res_bg, chi_bg = converter.generate_background(vp_bg, label_vol=label_vol)
-    
-    # 2. 借助 Builder 提取异常体的空间 Mask
-    builder = DatasetBuilder(dx, dy, dz)
-    _, mask_final, X, Y, Z = builder.inject_anomalies(vp_bg.copy(), [anomaly])
-    
-    # 3. 将背景赋予新变量，并施加异常体多物理场采样
-    vp_multi = vp_bg.copy()
-    rho_multi = rho_bg.copy()
-    res_multi = res_bg.copy()
-    chi_multi = chi_bg.copy()
-    
-    # 将 mask 转换并传入转换器
-    mask_bool = mask_final > 0
-    vp_multi, rho_multi, res_multi, chi_multi = converter.apply_anomaly(
-        mask_bool, anomaly_type_str, vp_multi, rho_multi, res_multi, chi_multi
-    )
+    model = build_multiphysics_model(vp_bg, label_vol, [anomaly], dx, dy, dz)
+    vp_multi = model["vp"]
+    rho_multi = model["rho"]
+    res_multi = model["resist"]
+    chi_multi = model["chi"]
+    mask_final = model["anomaly_label"]
+    X, Y, Z = model["X"], model["Y"], model["Z"]
     
     # 保存与可视化准备
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -161,7 +148,7 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
     # 统一增加 colorbar
     if show_colorbar:
         cb_vp = cigvis.create_colorbar_from_nodes(nodes_vp, label_str="Vp (m/s)")
-        cb_rho = cigvis.create_colorbar_from_nodes(nodes_rho, label_str="Density (kg/m^3)")
+        cb_rho = cigvis.create_colorbar_from_nodes(nodes_rho, label_str="Density (g/cm^3)")
         cb_res = cigvis.create_colorbar_from_nodes(nodes_res, label_str="log10(Res)")
         cb_chi = cigvis.create_colorbar_from_nodes(nodes_chi, label_str="Suscept(1e-5SI)")
         
@@ -181,7 +168,7 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
         savename=out_file, 
         savedir=save_dir, 
         run_app=run_app, 
-        title=[f"Vp (m/s) - {name_zh}", f"Density (kg/m^3)", f"log10(Resistivity) (Ohm.m)", f"Susceptibility (x1e-5 SI)"]
+        title=[f"Vp (m/s) - {name_zh}", f"Density (g/cm^3)", f"log10(Resistivity) (Ohm.m)", f"Susceptibility (x1e-5 SI)"]
     )
     print(f"Saved Multiphysics Visualization: {out_path}")
 

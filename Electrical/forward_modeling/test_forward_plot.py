@@ -5,12 +5,29 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mt_forward import MTForward3D
 
+
+def print_cuda_diagnostics():
+    print("CUDA diagnostics:")
+    print(f"  torch version: {torch.__version__}")
+    print(f"  torch cuda available: {torch.cuda.is_available()}")
+    print(f"  torch device count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        for idx in range(torch.cuda.device_count()):
+            major, minor = torch.cuda.get_device_capability(idx)
+            print(f"  device {idx}: {torch.cuda.get_device_name(idx)}")
+            print(f"    capability: {major}.{minor}")
+        print(f"  current device: {torch.cuda.current_device()}")
+    else:
+        print("  warning: no visible CUDA device. If forward runs, it will not have a valid GPU solver context.")
+
+
 if __name__ == "__main__":
     filepath = '/home/wangyh/Project/GMESUni/MTForward3D/MTModel/em_model_3d_50x30x50.bin'
     
     NX, NY, NZ = 50, 30, 50
     dx, dy, dz = 160.0, 160.0, 80.0
-    f_min, f_max = 0.01, 1000.0
+
+    print_cuda_diagnostics()
 
     print(f"Loading binary model from {filepath}")
     with open(filepath, 'rb') as f:
@@ -20,23 +37,7 @@ if __name__ == "__main__":
     # Numpy's shape (NZ, NY, NX) correctly maps to this memory layout.
     rho_tensor = torch.from_numpy(data.astype(np.float64)).view(NZ, NY, NX).permute(2, 1, 0).contiguous()
 
-    phoenix_coeffs = [8.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0]
-    max_power = int(np.ceil(np.log10(f_max)))
-    min_power = int(np.floor(np.log10(f_min)))
-    
-    freqs = []
-    for p in range(max_power, min_power - 1, -1):
-        power_of_10 = 10.0 ** p
-        for coeff in phoenix_coeffs:
-            current_f = float(coeff * power_of_10)
-            if current_f <= f_max * 1.0001 and current_f >= f_min * 0.9999:
-                freqs.append(current_f)
-                
-    if not freqs:
-        freqs = [f_max, f_min]
-        
-    print(f"Calculated {len(freqs)} Frequencies to solve.")
-    operator = MTForward3D(freqs, dx, dy, dz)
+    operator = MTForward3D(None, dx, dy, dz)
     
     # ==========================================
     # Run MT 3D Forward (Single GPU Original Version)
@@ -49,7 +50,9 @@ if __name__ == "__main__":
     app_res_multi, phase_multi = operator(rho_tensor)
     end_multi = time.time()
     time_multi = end_multi - start_multi
+    freqs = list(operator.last_freqs)
     print(f"✅ Executed 3D MT Forward in: {time_multi:.2f} s")
+    print(f"Auto-selected {len(freqs)} frequencies.")
     
     # ==========================================
     # Visualization
@@ -58,13 +61,13 @@ if __name__ == "__main__":
     print("📊 Generating Visualizations...")
     print("====================================")
     
-    app_res = app_res_multi.numpy()    # (n_freqs, NY, NX, 2)
-    phase = phase_multi.numpy()        # (n_freqs, NY, NX, 2)
+    app_res = app_res_multi.numpy()    # (n_freqs, NX, NY, 2)
+    phase = phase_multi.numpy()        # (n_freqs, NX, NY, 2)
     freqs_np = np.array(freqs)
     
     x_coords = (np.arange(NX) + 0.5) * dx
     y_coords = (np.arange(NY) + 0.5) * dy
-    X_grid, Y_grid = np.meshgrid(x_coords, y_coords) # X_grid: (NY, NX)
+    X_grid, Y_grid = np.meshgrid(x_coords, y_coords, indexing='ij')
 
     save_folder = './cache/'
     if not os.path.exists(save_folder):
@@ -89,11 +92,11 @@ if __name__ == "__main__":
     center_y_idx = NY // 2
     
     f_station = freqs_np
-    rxy_station = app_res[:, center_y_idx, center_x_idx, 0]
-    ryx_station = app_res[:, center_y_idx, center_x_idx, 1]
+    rxy_station = app_res[:, center_x_idx, center_y_idx, 0]
+    ryx_station = app_res[:, center_x_idx, center_y_idx, 1]
     
-    phi_xy_station = np.abs(phase[:, center_y_idx, center_x_idx, 0])
-    phi_yx_station_raw = phase[:, center_y_idx, center_x_idx, 1]
+    phi_xy_station = np.abs(phase[:, center_x_idx, center_y_idx, 0])
+    phi_yx_station_raw = phase[:, center_x_idx, center_y_idx, 1]
     
     phi_yx_station = phi_yx_station_raw + 180.0
     phi_yx_station = phi_yx_station % 360
@@ -149,11 +152,11 @@ if __name__ == "__main__":
     plt.close()
 
     # 4. Pseudosection
-    rho_xy_section = app_res[:, center_y_idx, :, 0]
-    rho_yx_section = app_res[:, center_y_idx, :, 1]
+    rho_xy_section = app_res[:, :, center_y_idx, 0]
+    rho_yx_section = app_res[:, :, center_y_idx, 1]
     
-    phi_xy_section = np.abs(phase[:, center_y_idx, :, 0])
-    phi_yx_section_raw = phase[:, center_y_idx, :, 1]
+    phi_xy_section = np.abs(phase[:, :, center_y_idx, 0])
+    phi_yx_section_raw = phase[:, :, center_y_idx, 1]
     phi_yx_section = phi_yx_section_raw + 180.0
     phi_yx_section = phi_yx_section % 360
     phi_yx_section = np.where(phi_yx_section > 180, phi_yx_section - 360, phi_yx_section)
@@ -211,6 +214,6 @@ if __name__ == "__main__":
 
     print("All visualizations complete! Check the './cache/' directory for PNGs.")
     # save data for 3D visualization
-    np.savetxt(os.path.join(save_folder, 'apparent_res_3d.txt'), app_res.reshape(len(freqs_np), NY, NX, 2).reshape(len(freqs_np), -1))
-    np.savetxt(os.path.join(save_folder, 'phase_3d.txt'), phase.reshape(len(freqs_np), NY, NX, 2).reshape(len(freqs_np), -1))
+    np.savetxt(os.path.join(save_folder, 'apparent_res_3d.txt'), app_res.reshape(len(freqs_np), NX, NY, 2).reshape(len(freqs_np), -1))
+    np.savetxt(os.path.join(save_folder, 'phase_3d.txt'), phase.reshape(len(freqs_np), NX, NY, 2).reshape(len(freqs_np), -1))
     print(f"-> Saved 3D data for visualization: {os.path.join(save_folder, 'apparent_res_3d.txt')}, {os.path.join(save_folder, 'phase_3d.txt')}")

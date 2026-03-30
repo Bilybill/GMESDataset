@@ -15,9 +15,9 @@ class PetrophysicsConverter:
 
     FACIES_PARAMS = {
         FACIES_SHALE: {
-            "density_a": 255.0,
+            "density_a": 0.255,
             "density_b": 0.275,
-            "density_clip": (1950.0, 2900.0),
+            "density_clip": (1.95, 2.90),
             "vm": 3950.0,
             "vf": 1500.0,
             "phi0": 0.18,
@@ -38,9 +38,9 @@ class PetrophysicsConverter:
             "chi_span": 5.0e-5,
         },
         FACIES_SANDSTONE: {
-            "density_a": 292.0,
+            "density_a": 0.292,
             "density_b": 0.255,
-            "density_clip": (2050.0, 2850.0),
+            "density_clip": (2.05, 2.85),
             "vm": 5400.0,
             "vf": 1500.0,
             "phi0": 0.30,
@@ -61,9 +61,9 @@ class PetrophysicsConverter:
             "chi_span": 1.5e-5,
         },
         FACIES_CARBONATE: {
-            "density_a": 308.0,
+            "density_a": 0.308,
             "density_b": 0.248,
-            "density_clip": (2200.0, 3000.0),
+            "density_clip": (2.20, 3.00),
             "vm": 6400.0,
             "vf": 1500.0,
             "phi0": 0.12,
@@ -328,7 +328,7 @@ class PetrophysicsConverter:
 
         if anomaly_type == "Gas":
             vp[mask] = np.clip(vp[mask] * np.clip(0.62 + 0.08 * noise[mask], 0.45, 0.82), 1400.0, None)
-            rho[mask] = np.clip(rho[mask] * np.clip(0.90 + 0.04 * noise[mask], 0.82, 0.98), 1400.0, None)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.90 + 0.04 * noise[mask], 0.82, 0.98), 1.40, None)
             facies[mask] = np.maximum(facies[mask], self.FACIES_SANDSTONE)
             phi[mask] = np.clip(phi[mask] * np.clip(1.10 + 0.05 * noise[mask], 0.95, 1.25), 0.05, 0.35)
             sw[mask] = np.clip(0.20 + 0.10 * (1.0 + noise[mask]), 0.05, 0.45)
@@ -339,7 +339,7 @@ class PetrophysicsConverter:
 
         elif anomaly_type == "Hydrate":
             vp[mask] = np.clip(vp[mask] * np.clip(1.18 + 0.08 * noise[mask], 1.05, 1.35), None, 4500.0)
-            rho[mask] = np.clip(rho[mask] * np.clip(0.93 + 0.03 * noise[mask], 0.86, 0.99), 1500.0, None)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.93 + 0.03 * noise[mask], 0.86, 0.99), 1.50, None)
             facies[mask] = np.maximum(facies[mask], self.FACIES_SANDSTONE)
             phi[mask] = np.clip(phi[mask] * np.clip(0.86 + 0.05 * noise[mask], 0.70, 0.96), 0.02, 0.25)
             sw[mask] = np.clip(0.45 + 0.12 * (1.0 + noise[mask]), 0.20, 0.70)
@@ -348,7 +348,7 @@ class PetrophysicsConverter:
 
         elif anomaly_type == "BrineFault":
             vp[mask] = np.clip(vp[mask] * np.clip(0.82 + 0.06 * noise[mask], 0.65, 0.96), 1400.0, None)
-            rho[mask] = np.clip(rho[mask] * np.clip(0.92 + 0.04 * noise[mask], 0.80, 0.98), 1500.0, None)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.92 + 0.04 * noise[mask], 0.80, 0.98), 1.50, None)
             facies[mask] = self.FACIES_SHALE
             phi[mask] = np.clip(phi[mask] * np.clip(1.22 + 0.10 * noise[mask], 1.05, 1.60), 0.08, 0.40)
             sw[mask] = np.clip(0.95 + 0.03 * noise[mask], 0.80, 1.0)
@@ -358,25 +358,26 @@ class PetrophysicsConverter:
 
         elif anomaly_type == "Sulfide":
             vp[mask] = self._generate_heterogeneous_prop(shape, mask, 5500.0, 6800.0, noise_level=0.04)
-            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 3500.0, 4800.0, noise_level=0.05)
+            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 3.50, 4.80, noise_level=0.05)
             res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 0.001, 0.1, noise_level=0.22, sigma=3.0)
             chi[mask] = self._generate_heterogeneous_prop(shape, mask, 0.05, 0.2, noise_level=0.15)
 
         elif anomaly_type == "Igneous":
             vp[mask] = self._generate_heterogeneous_prop(shape, mask, 5000.0, 6500.0, noise_level=0.05)
-            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 2700.0, 3100.0, noise_level=0.03)
+            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 2.70, 3.10, noise_level=0.03)
             res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 2000.0, 10000.0, noise_level=0.15, sigma=6.0)
             chi[mask] = self._generate_heterogeneous_prop(shape, mask, 0.01, 0.08, noise_level=0.20)
 
         elif anomaly_type == "Serpentinized":
             vp[mask] = np.clip(vp[mask] * np.clip(0.76 + 0.08 * noise[mask], 0.55, 0.92), 1800.0, None)
-            rho[mask] = np.clip(rho[mask] * np.clip(0.88 + 0.04 * noise[mask], 0.75, 0.97), 1800.0, None)
-            res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 50.0, 500.0, noise_level=0.18, sigma=5.0)
+            rho[mask] = np.clip(rho[mask] * np.clip(0.88 + 0.04 * noise[mask], 0.75, 0.97), 1.80, None)
+            res_scale = np.clip(0.65 + 0.12 * noise[mask], 0.25, 0.95)
+            res[mask] = np.clip(res[mask] * res_scale, 1.0, 200.0)
             chi[mask] = np.clip(chi[mask] + self._generate_heterogeneous_prop(shape, mask, 0.01, 0.05, noise_level=0.20), 0.0, 0.1)
 
         elif anomaly_type == "SaltDome":
             vp[mask] = self._generate_heterogeneous_prop(shape, mask, 4200.0, 5500.0, noise_level=0.02, sigma=14.0)
-            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 2100.0, 2250.0, noise_level=0.01, sigma=18.0)
+            rho[mask] = self._generate_heterogeneous_prop(shape, mask, 2.10, 2.25, noise_level=0.01, sigma=18.0)
             res[mask] = self._generate_log_heterogeneous_prop(shape, mask, 8000.0, 30000.0, noise_level=0.08, sigma=10.0)
             chi[mask] = np.clip(-1.0e-5 + 2.0e-6 * noise[mask], -2.0e-5, 0.0)
 

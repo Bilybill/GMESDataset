@@ -6,6 +6,17 @@
 #include <vector>
 #include <complex>
 
+struct BoundaryConditionPlan;
+
+BoundaryConditionPlan* createBoundaryConditionPlan3D(const HostMesh3D &mesh,
+                                                     const std::vector<int> &csrColInd,
+                                                     const std::vector<int> &csrRowPtr);
+
+void destroyBoundaryConditionPlan3D(BoundaryConditionPlan* plan);
+
+void getBoundaryConditionModifiedValueIndices3D(const BoundaryConditionPlan* plan,
+                                                std::vector<int> &indices);
+
 // 施加 3D 边界条件
 // polarization = 1: Ex 极化; polarization = 2: Ey 极化
 void applyBoundaryConditions3D(const HostMesh3D &mesh, double freq, double rho_bg,
@@ -13,6 +24,7 @@ void applyBoundaryConditions3D(const HostMesh3D &mesh, double freq, double rho_b
                                std::vector<int> &csrColInd, 
                                const std::vector<int> &csrRowPtr,
                                std::vector<std::complex<double>> &b,
-                               int polarization);
+                               int polarization,
+                               const BoundaryConditionPlan* plan = nullptr);
 
 #endif // BOUNDARYCONDITIONS3D_H

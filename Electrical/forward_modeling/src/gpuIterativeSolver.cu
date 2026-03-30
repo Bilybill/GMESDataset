@@ -6,6 +6,33 @@
 #include <cuComplex.h>
 #include <iostream>
 #include <cmath>
+#include <stdexcept>
+
+struct GpuBiCGStabContext {
+    int N = 0;
+    int nnz = 0;
+    bool structureInitialized = false;
+    std::vector<int> diagonalIndices;
+    cublasHandle_t cublasH = nullptr;
+    cusparseHandle_t cusparseH = nullptr;
+    int *d_csrRowPtr = nullptr;
+    int *d_csrColInd = nullptr;
+    cuDoubleComplex *d_csrVal = nullptr;
+    cuDoubleComplex *d_b = nullptr;
+    cuDoubleComplex *d_x = nullptr;
+    cuDoubleComplex *d_Minv = nullptr;
+    cuDoubleComplex *d_r = nullptr;
+    cuDoubleComplex *d_r0_hat = nullptr;
+    cuDoubleComplex *d_p = nullptr;
+    cuDoubleComplex *d_v = nullptr;
+    cuDoubleComplex *d_s = nullptr;
+    cuDoubleComplex *d_t = nullptr;
+    cuDoubleComplex *d_yp = nullptr;
+    cuDoubleComplex *d_ys = nullptr;
+    cusparseSpMatDescr_t matA = nullptr;
+    void* dBuffer = nullptr;
+    size_t bufferSize = 0;
+};
 
 __global__ void complexElementWiseMul(int n, const cuDoubleComplex* a, const cuDoubleComplex* b, cuDoubleComplex* c) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -18,6 +45,126 @@ inline cuDoubleComplex to_cuDoubleComplex(const std::complex<double>& c) {
     return make_cuDoubleComplex(c.real(), c.imag());
 }
 
+namespace {
+
+GpuBiCGStabContext* allocate_context(int N, int nnz) {
+    auto* context = new GpuBiCGStabContext();
+    context->N = N;
+    context->nnz = nnz;
+
+    cublasCreate(&context->cublasH);
+    cusparseCreate(&context->cusparseH);
+
+    cudaMalloc((void**)&context->d_csrRowPtr, (N + 1) * sizeof(int));
+    cudaMalloc((void**)&context->d_csrColInd, nnz * sizeof(int));
+    cudaMalloc((void**)&context->d_csrVal, nnz * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_b, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_x, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_Minv, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_r, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_r0_hat, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_p, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_v, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_s, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_t, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_yp, N * sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&context->d_ys, N * sizeof(cuDoubleComplex));
+
+    cusparseCreateCsr(&context->matA, N, N, nnz, context->d_csrRowPtr, context->d_csrColInd, context->d_csrVal,
+                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_C_64F);
+
+    cuDoubleComplex alpha_c = make_cuDoubleComplex(1.0, 0.0);
+    cuDoubleComplex beta_c  = make_cuDoubleComplex(0.0, 0.0);
+    cusparseDnVecDescr_t vecX, vecY;
+    cusparseCreateDnVec(&vecX, N, context->d_p, CUDA_C_64F);
+    cusparseCreateDnVec(&vecY, N, context->d_t, CUDA_C_64F);
+    cusparseSpMV_bufferSize(context->cusparseH, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            &alpha_c, context->matA, vecX, &beta_c, vecY,
+                            CUDA_C_64F, CUSPARSE_SPMV_ALG_DEFAULT, &context->bufferSize);
+    cudaMalloc(&context->dBuffer, context->bufferSize);
+    cusparseDestroyDnVec(vecX);
+    cusparseDestroyDnVec(vecY);
+
+    return context;
+}
+
+void free_context(GpuBiCGStabContext* context) {
+    if (!context) {
+        return;
+    }
+
+    cudaFree(context->d_csrRowPtr);
+    cudaFree(context->d_csrColInd);
+    cudaFree(context->d_csrVal);
+    cudaFree(context->d_b);
+    cudaFree(context->d_x);
+    cudaFree(context->d_Minv);
+    cudaFree(context->d_r);
+    cudaFree(context->d_r0_hat);
+    cudaFree(context->d_p);
+    cudaFree(context->d_v);
+    cudaFree(context->d_s);
+    cudaFree(context->d_t);
+    cudaFree(context->d_yp);
+    cudaFree(context->d_ys);
+    cudaFree(context->dBuffer);
+
+    if (context->matA) {
+        cusparseDestroySpMat(context->matA);
+    }
+    if (context->cusparseH) {
+        cusparseDestroy(context->cusparseH);
+    }
+    if (context->cublasH) {
+        cublasDestroy(context->cublasH);
+    }
+    delete context;
+}
+
+void validate_context(const GpuBiCGStabContext* context, int N, int nnz) {
+    if (!context) {
+        return;
+    }
+    if (context->N != N || context->nnz != nnz) {
+        throw std::runtime_error("GpuBiCGStabContext size mismatch");
+    }
+}
+
+void initialize_structure_if_needed(GpuBiCGStabContext* context,
+                                    const std::vector<int> &h_csrRowPtr,
+                                    const std::vector<int> &h_csrColInd)
+{
+    if (context->structureInitialized) {
+        return;
+    }
+
+    cudaMemcpy(context->d_csrRowPtr, h_csrRowPtr.data(), (context->N + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(context->d_csrColInd, h_csrColInd.data(), context->nnz * sizeof(int), cudaMemcpyHostToDevice);
+
+    context->diagonalIndices.assign(context->N, -1);
+    for (int row = 0; row < context->N; ++row) {
+        for (int idx = h_csrRowPtr[row]; idx < h_csrRowPtr[row + 1]; ++idx) {
+            if (h_csrColInd[idx] == row) {
+                context->diagonalIndices[row] = idx;
+                break;
+            }
+        }
+    }
+    context->structureInitialized = true;
+}
+
+} // namespace
+
+GpuBiCGStabContext* create_gpu_bicgstab_context(int N, int nnz)
+{
+    return allocate_context(N, nnz);
+}
+
+void destroy_gpu_bicgstab_context(GpuBiCGStabContext* context)
+{
+    free_context(context);
+}
+
 bool gpu_complex_solver_bicgstab(int N,
                                  const std::vector<int> &h_csrRowPtr,
                                  const std::vector<int> &h_csrColInd,
@@ -25,132 +172,100 @@ bool gpu_complex_solver_bicgstab(int N,
                                  const std::vector<std::complex<double>> &h_b,
                                  std::vector<std::complex<double>> &x,
                                  double tol,
-                                 int maxIter)
+                                 int maxIter,
+                                 GpuBiCGStabContext* context,
+                                 SolverStats* stats)
 {
-    // ==========================================================
-    // 工业级 Right-Preconditioned BiCGStab
-    // 利用混合内积 (Zdotu / Zdotc) 完美镇压低频复对称矩阵的震荡！
-    // ==========================================================
-    
     int nnz = static_cast<int>(h_csrVal.size());
+    validate_context(context, N, nnz);
+    bool ownsContext = false;
+    if (!context) {
+        context = allocate_context(N, nnz);
+        ownsContext = true;
+    }
 
-    cublasHandle_t cublasH = NULL;
-    cusparseHandle_t cusparseH = NULL;
-    cublasCreate(&cublasH);
-    cusparseCreate(&cusparseH);
+    if (stats) {
+        *stats = SolverStats{};
+    }
 
-    // 1. 提取对角线，计算 Jacobi 预条件子 (M_inv = 1 / diag(A))
+    initialize_structure_if_needed(context, h_csrRowPtr, h_csrColInd);
+
     std::vector<cuDoubleComplex> h_M_inv(N);
     for (int i = 0; i < N; ++i) {
         cuDoubleComplex diag = make_cuDoubleComplex(1.0, 0.0);
-        for (int j = h_csrRowPtr[i]; j < h_csrRowPtr[i+1]; ++j) {
-            if (h_csrColInd[j] == i) {
-                diag = to_cuDoubleComplex(h_csrVal[j]);
-                break;
-            }
+        int diagIndex = context->diagonalIndices[i];
+        if (diagIndex >= 0) {
+            diag = to_cuDoubleComplex(h_csrVal[diagIndex]);
         }
-        double mag_sq = cuCreal(diag)*cuCreal(diag) + cuCimag(diag)*cuCimag(diag);
+        double mag_sq = cuCreal(diag) * cuCreal(diag) + cuCimag(diag) * cuCimag(diag);
         if (mag_sq > 1e-30) {
-            h_M_inv[i] = make_cuDoubleComplex(cuCreal(diag)/mag_sq, -cuCimag(diag)/mag_sq);
+            h_M_inv[i] = make_cuDoubleComplex(cuCreal(diag) / mag_sq, -cuCimag(diag) / mag_sq);
         } else {
             h_M_inv[i] = make_cuDoubleComplex(1.0, 0.0);
         }
     }
 
-    // 2. 分配显存
-    int *d_csrRowPtr, *d_csrColInd;
-    cuDoubleComplex *d_csrVal, *d_b, *d_x, *d_Minv;
-    cuDoubleComplex *d_r, *d_r0_hat, *d_p, *d_v, *d_s, *d_t, *d_yp, *d_ys;
-
-    cudaMalloc((void**)&d_csrRowPtr, (N + 1) * sizeof(int));
-    cudaMalloc((void**)&d_csrColInd, nnz * sizeof(int));
-    cudaMalloc((void**)&d_csrVal, nnz * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_b, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_x, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_Minv, N * sizeof(cuDoubleComplex));
-    
-    cudaMalloc((void**)&d_r, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_r0_hat, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_p, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_v, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_s, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_t, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_yp, N * sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&d_ys, N * sizeof(cuDoubleComplex));
-
-    cudaMemcpy(d_csrRowPtr, h_csrRowPtr.data(), (N + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_csrColInd, h_csrColInd.data(), nnz * sizeof(int), cudaMemcpyHostToDevice);
-    
     std::vector<cuDoubleComplex> c_csrVal(nnz), c_b(N), c_x(N);
     for (int i = 0; i < nnz; i++) c_csrVal[i] = to_cuDoubleComplex(h_csrVal[i]);
     for (int i = 0; i < N; i++) {
         c_b[i] = to_cuDoubleComplex(h_b[i]);
-        c_x[i] = to_cuDoubleComplex(x[i]); 
+        c_x[i] = to_cuDoubleComplex(x[i]);
     }
 
-    cudaMemcpy(d_csrVal, c_csrVal.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, c_b.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_x, c_x.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice); 
-    cudaMemcpy(d_Minv, h_M_inv.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    cudaMemcpy(context->d_csrVal, c_csrVal.data(), nnz * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    cudaMemcpy(context->d_b, c_b.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    cudaMemcpy(context->d_x, c_x.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    cudaMemcpy(context->d_Minv, h_M_inv.data(), N * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
 
     cuDoubleComplex alpha_c = make_cuDoubleComplex(1.0, 0.0);
     cuDoubleComplex beta_c  = make_cuDoubleComplex(0.0, 0.0);
-
-    // 3. 配置 cuSPARSE SpMV
-    cusparseSpMatDescr_t matA;
-    cusparseCreateCsr(&matA, N, N, nnz, d_csrRowPtr, d_csrColInd, d_csrVal,
-                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_C_64F);
-
-    size_t bufferSize = 0;
-    cusparseDnVecDescr_t vecX, vecY;
-    cusparseCreateDnVec(&vecX, N, d_p, CUDA_C_64F);
-    cusparseCreateDnVec(&vecY, N, d_t, CUDA_C_64F);
-    cusparseSpMV_bufferSize(cusparseH, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_c, matA, vecX, &beta_c, vecY, CUDA_C_64F, CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
-    
-    void* dBuffer = NULL;
-    cudaMalloc(&dBuffer, bufferSize);
-    cusparseDestroyDnVec(vecX);
-    cusparseDestroyDnVec(vecY);
 
     auto SpMV_A = [&](cuDoubleComplex* in, cuDoubleComplex* out) {
         cusparseDnVecDescr_t vIn, vOut;
         cusparseCreateDnVec(&vIn, N, in, CUDA_C_64F);
         cusparseCreateDnVec(&vOut, N, out, CUDA_C_64F);
-        cusparseSpMV(cusparseH, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_c, matA, vIn, &beta_c, vOut, CUDA_C_64F, CUSPARSE_SPMV_ALG_DEFAULT, dBuffer);
+        cusparseSpMV(context->cusparseH, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_c, context->matA, vIn, &beta_c, vOut, CUDA_C_64F, CUSPARSE_SPMV_ALG_DEFAULT, context->dBuffer);
         cusparseDestroyDnVec(vIn);
         cusparseDestroyDnVec(vOut);
     };
 
-    // ==========================================
-    // 4. 执行 Right-Preconditioned BiCGStab
-    // ==========================================
     double norm_b, res_norm;
-    cublasDznrm2(cublasH, N, d_b, 1, &norm_b);
-    if(norm_b == 0.0) norm_b = 1.0;
+    cublasDznrm2(context->cublasH, N, context->d_b, 1, &norm_b);
+    if (norm_b == 0.0) norm_b = 1.0;
 
     cuDoubleComplex rho_prev = make_cuDoubleComplex(1.0, 0.0);
     cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
     cuDoubleComplex omega = make_cuDoubleComplex(1.0, 0.0);
 
-    cudaMemset(d_p, 0, N * sizeof(cuDoubleComplex));
-    cudaMemset(d_v, 0, N * sizeof(cuDoubleComplex));
+    cudaMemset(context->d_p, 0, N * sizeof(cuDoubleComplex));
+    cudaMemset(context->d_v, 0, N * sizeof(cuDoubleComplex));
 
-    // 计算初始残差: r0 = b - A * x0
-    cudaMemcpy(d_r, d_b, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
-    cublasDznrm2(cublasH, N, d_x, 1, &res_norm);
-    if (res_norm > 0.0) { // Warm Start
-        SpMV_A(d_x, d_t);
+    cudaMemcpy(context->d_r, context->d_b, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
+    cublasDznrm2(context->cublasH, N, context->d_x, 1, &res_norm);
+    if (res_norm > 0.0) {
+        SpMV_A(context->d_x, context->d_t);
         cuDoubleComplex neg_one = make_cuDoubleComplex(-1.0, 0.0);
-        cublasZaxpy(cublasH, N, &neg_one, d_t, 1, d_r, 1);
+        cublasZaxpy(context->cublasH, N, &neg_one, context->d_t, 1, context->d_r, 1);
     }
-    
-    // r0_hat = r0 (固定投影向量)
-    cudaMemcpy(d_r0_hat, d_r, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
 
-    cublasDznrm2(cublasH, N, d_r, 1, &res_norm);
+    cudaMemcpy(context->d_r0_hat, context->d_r, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
+
+    cublasDznrm2(context->cublasH, N, context->d_r, 1, &res_norm);
     if (res_norm / norm_b < tol) {
         std::cout << "  -> BiCGStab converged immediately (Warm Start). Final res: " << res_norm / norm_b << std::endl;
-        return true; 
+        if (stats) {
+            stats->iterations = 0;
+            stats->finalResidual = res_norm / norm_b;
+            stats->converged = true;
+        }
+        cudaMemcpy(c_x.data(), context->d_x, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+        for (int i = 0; i < N; i++) {
+            x[i] = std::complex<double>(cuCreal(c_x[i]), cuCimag(c_x[i]));
+        }
+        if (ownsContext) {
+            free_context(context);
+        }
+        return true;
     }
 
     int threads = 256;
@@ -161,70 +276,56 @@ bool gpu_complex_solver_bicgstab(int N,
 
     for (iter = 1; iter <= maxIter; ++iter) {
         cuDoubleComplex rho;
-        // ⚠️【极其核心】：BiCG 投影步骤，必须无共轭 (Zdotu) 维持复对称性！
-        cublasZdotu(cublasH, N, d_r0_hat, 1, d_r, 1, &rho); 
-        
-        if (cuCabs(rho) < 1e-30) break; // Breakdown
+        cublasZdotu(context->cublasH, N, context->d_r0_hat, 1, context->d_r, 1, &rho);
+
+        if (cuCabs(rho) < 1e-30) break;
 
         cuDoubleComplex beta = cuCmul(cuCdiv(rho, rho_prev), cuCdiv(alpha, omega));
 
-        // p = r + beta * (p - omega * v)
         cuDoubleComplex neg_omega = make_cuDoubleComplex(-cuCreal(omega), -cuCimag(omega));
-        cublasZaxpy(cublasH, N, &neg_omega, d_v, 1, d_p, 1);
-        cublasZscal(cublasH, N, &beta, d_p, 1);
+        cublasZaxpy(context->cublasH, N, &neg_omega, context->d_v, 1, context->d_p, 1);
+        cublasZscal(context->cublasH, N, &beta, context->d_p, 1);
         cuDoubleComplex one_c = make_cuDoubleComplex(1.0, 0.0);
-        cublasZaxpy(cublasH, N, &one_c, d_r, 1, d_p, 1);
+        cublasZaxpy(context->cublasH, N, &one_c, context->d_r, 1, context->d_p, 1);
 
-        // 预处理: yp = M_inv * p
-        complexElementWiseMul<<<blocks, threads>>>(N, d_Minv, d_p, d_yp);
-        
-        // v = A * yp
-        SpMV_A(d_yp, d_v);
+        complexElementWiseMul<<<blocks, threads>>>(N, context->d_Minv, context->d_p, context->d_yp);
+        SpMV_A(context->d_yp, context->d_v);
 
-        // alpha = rho / (r0_hat, v) 
         cuDoubleComplex r0_v;
-        cublasZdotu(cublasH, N, d_r0_hat, 1, d_v, 1, &r0_v); 
+        cublasZdotu(context->cublasH, N, context->d_r0_hat, 1, context->d_v, 1, &r0_v);
         if (cuCabs(r0_v) < 1e-30) break;
         alpha = cuCdiv(rho, r0_v);
 
-        // s = r - alpha * v
-        cudaMemcpy(d_s, d_r, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(context->d_s, context->d_r, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
         cuDoubleComplex neg_alpha = make_cuDoubleComplex(-cuCreal(alpha), -cuCimag(alpha));
-        cublasZaxpy(cublasH, N, &neg_alpha, d_v, 1, d_s, 1);
+        cublasZaxpy(context->cublasH, N, &neg_alpha, context->d_v, 1, context->d_s, 1);
 
-        cublasDznrm2(cublasH, N, d_s, 1, &res_norm);
+        cublasDznrm2(context->cublasH, N, context->d_s, 1, &res_norm);
         if (res_norm / norm_b < tol) {
-            cublasZaxpy(cublasH, N, &alpha, d_yp, 1, d_x, 1);
+            cublasZaxpy(context->cublasH, N, &alpha, context->d_yp, 1, context->d_x, 1);
             converged = true;
             break;
         }
 
-        // 预处理: ys = M_inv * s
-        complexElementWiseMul<<<blocks, threads>>>(N, d_Minv, d_s, d_ys);
-        
-        // t = A * ys
-        SpMV_A(d_ys, d_t);
+        complexElementWiseMul<<<blocks, threads>>>(N, context->d_Minv, context->d_s, context->d_ys);
+        SpMV_A(context->d_ys, context->d_t);
 
-        // omega = (t, s) / (t, t) 
-        // ⚠️【极其核心】：MR 残差最小化步骤，必须共轭 (Zdotc) 求模长！
         cuDoubleComplex ts, tt;
-        cublasZdotc(cublasH, N, d_t, 1, d_s, 1, &ts);
-        cublasZdotc(cublasH, N, d_t, 1, d_t, 1, &tt);
+        cublasZdotc(context->cublasH, N, context->d_t, 1, context->d_s, 1, &ts);
+        cublasZdotc(context->cublasH, N, context->d_t, 1, context->d_t, 1, &tt);
         if (cuCabs(tt) < 1e-30) break;
         omega = cuCdiv(ts, tt);
 
-        // x = x + alpha * yp + omega * ys
-        cublasZaxpy(cublasH, N, &alpha, d_yp, 1, d_x, 1);
-        cublasZaxpy(cublasH, N, &omega, d_ys, 1, d_x, 1);
+        cublasZaxpy(context->cublasH, N, &alpha, context->d_yp, 1, context->d_x, 1);
+        cublasZaxpy(context->cublasH, N, &omega, context->d_ys, 1, context->d_x, 1);
 
-        // r = s - omega * t
-        cudaMemcpy(d_r, d_s, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(context->d_r, context->d_s, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
         neg_omega = make_cuDoubleComplex(-cuCreal(omega), -cuCimag(omega));
-        cublasZaxpy(cublasH, N, &neg_omega, d_t, 1, d_r, 1);
+        cublasZaxpy(context->cublasH, N, &neg_omega, context->d_t, 1, context->d_r, 1);
 
         rho_prev = rho;
 
-        cublasDznrm2(cublasH, N, d_r, 1, &res_norm);
+        cublasDznrm2(context->cublasH, N, context->d_r, 1, &res_norm);
         if (res_norm / norm_b < tol) {
             converged = true;
             break;
@@ -241,19 +342,20 @@ bool gpu_complex_solver_bicgstab(int N,
         std::cerr << "  -> BiCGStab failed to converge within maxIter. Final res: " << res_norm / norm_b << std::endl;
     }
 
-    cudaMemcpy(c_x.data(), d_x, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+    if (stats) {
+        stats->iterations = iter;
+        stats->finalResidual = res_norm / norm_b;
+        stats->converged = converged;
+    }
+
+    cudaMemcpy(c_x.data(), context->d_x, N * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
     for (int i = 0; i < N; i++) {
         x[i] = std::complex<double>(cuCreal(c_x[i]), cuCimag(c_x[i]));
     }
 
-    // 释放资源
-    cudaFree(d_csrRowPtr); cudaFree(d_csrColInd); cudaFree(d_csrVal);
-    cudaFree(d_b); cudaFree(d_x); cudaFree(d_Minv);
-    cudaFree(d_r); cudaFree(d_r0_hat); cudaFree(d_p); cudaFree(d_v);
-    cudaFree(d_s); cudaFree(d_t); cudaFree(d_yp); cudaFree(d_ys);
-    cudaFree(dBuffer);
-    cusparseDestroySpMat(matA);
-    cusparseDestroy(cusparseH); cublasDestroy(cublasH);
+    if (ownsContext) {
+        free_context(context);
+    }
 
     return converged;
 }

@@ -90,6 +90,13 @@ extern "C" void gpu_femAssemble3D_Matrix(
 
 std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor, double dx, double dy, double dz, std::vector<double> freqs) {
     TORCH_CHECK(rho_tensor.is_contiguous(), "rho_tensor must be contiguous");
+    int device_count = 0;
+    cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
+    TORCH_CHECK(
+        cuda_status == cudaSuccess && device_count > 0,
+        "mt_forward_cuda requires a working CUDA runtime and at least one visible GPU. "
+        "cudaGetDeviceCount failed with: ", cudaGetErrorString(cuda_status)
+    );
     double* rho_ptr = rho_tensor.data_ptr<double>();
     
     int NX = rho_tensor.size(0);
@@ -157,12 +164,39 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
     HostMesh3D mesh = generateMesh3D(NX_pad, NY_pad, NZ_pad, hx, hy, hz);
     int NDoF = mesh.NEdges;
     
+    if (freqs.empty()) {
+        double skin_depth_min = dz * 2.0;
+        double total_depth = NZ * dz;
+        double skin_depth_max = total_depth / 3.0;
+        double f_max = bg_rho_for_bc * std::pow(503.0 / skin_depth_min, 2.0);
+        double f_min = bg_rho_for_bc * std::pow(503.0 / skin_depth_max, 2.0);
+
+        std::vector<double> phoenix_coeffs = {8.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0};
+        int max_power = std::ceil(std::log10(f_max));
+        int min_power = std::floor(std::log10(f_min));
+
+        for (int p = max_power; p >= min_power; --p) {
+            double power_of_10 = std::pow(10.0, p);
+            for (double coeff : phoenix_coeffs) {
+                double current_f = coeff * power_of_10;
+                if (current_f <= f_max && current_f >= f_min) {
+                    freqs.push_back(current_f);
+                }
+            }
+        }
+
+        if (freqs.empty()) {
+            freqs.push_back(f_max);
+            freqs.push_back(f_min);
+        }
+    }
+
     int n_freqs = (int)freqs.size();
     
     auto options = torch::TensorOptions().dtype(torch::kFloat64);
-    // [n_freq, NY, NX, 2] -> xy and yx at the end
-    torch::Tensor app_res = torch::empty({n_freqs, NY, NX, 2}, options);
-    torch::Tensor phase = torch::empty({n_freqs, NY, NX, 2}, options);
+    // Keep GMESDataset's repository-wide convention: [n_freq, NX, NY, 2].
+    torch::Tensor app_res = torch::empty({n_freqs, NX, NY, 2}, options);
+    torch::Tensor phase = torch::empty({n_freqs, NX, NY, 2}, options);
     
     double* res_ptr = app_res.data_ptr<double>();
     double* phs_ptr = phase.data_ptr<double>();
@@ -206,6 +240,13 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
     cudaMemcpy(d_csrRowPtr, h_csrRowPtr.data(), h_csrRowPtr.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_csrColInd, h_csrColInd.data(), h_csrColInd.size() * sizeof(int), cudaMemcpyHostToDevice);
 
+    GpuBiCGStabContext* solverContext = create_gpu_bicgstab_context(NDoF, nnz);
+    BoundaryConditionPlan* boundaryPlan = createBoundaryConditionPlan3D(mesh, h_csrColInd, h_csrRowPtr);
+    std::vector<int> modifiedValueIndices;
+    getBoundaryConditionModifiedValueIndices3D(boundaryPlan, modifiedValueIndices);
+    std::vector<std::complex<double>> csrVal_work(nnz);
+    std::vector<std::complex<double>> b_work(NDoF);
+
     for (int ff = 0; ff < n_freqs; ff++) {
         double freq = freqs[ff];
         std::cout << "\n=== Processing Frequency " << ff + 1 << "/" << n_freqs << ": " << freq << " Hz ===" << std::endl;
@@ -218,23 +259,29 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
         
         std::vector<std::complex<double>> csrVal_base(nnz);
         cudaMemcpy(csrVal_base.data(), d_csrVal, nnz * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+        csrVal_work = csrVal_base;
         
         // 我们利用上面 CPU 版本算好的 h_csrColInd, h_csrRowPtr
         std::vector<int>& csrColInd = h_csrColInd;
         std::vector<int>& csrRowPtr = h_csrRowPtr;
         
-        std::vector<std::complex<double>> csrVal_pol1 = csrVal_base; 
-        std::vector<std::complex<double>> b_pol1(NDoF);
-        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_pol1, csrColInd, csrRowPtr, b_pol1, 1);
+        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_work, csrColInd, csrRowPtr, b_work, 1, boundaryPlan);
         std::cout << "  -> Solving Polarization 1 (Ex) using BiCGStab..." << std::endl;
-        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_pol1, b_pol1, x_pol1, 1e-7, 50000);
+        SolverStats pol1Stats;
+        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_work, b_work, x_pol1, 1e-7, 50000, solverContext, &pol1Stats);
+        std::cout << "     Polarization 1 stats: iterations=" << pol1Stats.iterations
+                  << ", residual=" << pol1Stats.finalResidual << std::endl;
         auto fields_pol1 = computeSurfaceFields(mesh, freq, x_pol1, NX, NY, npad);
         
-        std::vector<std::complex<double>> csrVal_pol2 = csrVal_base; 
-        std::vector<std::complex<double>> b_pol2(NDoF);
-        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_pol2, csrColInd, csrRowPtr, b_pol2, 2);
+        for (int idx : modifiedValueIndices) {
+            csrVal_work[idx] = csrVal_base[idx];
+        }
+        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_work, csrColInd, csrRowPtr, b_work, 2, boundaryPlan);
         std::cout << "  -> Solving Polarization 2 (Ey) using BiCGStab..." << std::endl;
-        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_pol2, b_pol2, x_pol2, 1e-7, 50000);
+        SolverStats pol2Stats;
+        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_work, b_work, x_pol2, 1e-7, 50000, solverContext, &pol2Stats);
+        std::cout << "     Polarization 2 stats: iterations=" << pol2Stats.iterations
+                  << ", residual=" << pol2Stats.finalResidual << std::endl;
         auto fields_pol2 = computeSurfaceFields(mesh, freq, x_pol2, NX, NY, npad);
         
         for (int j = 0; j < NY; ++j) {
@@ -256,7 +303,7 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
                     phi_yx = std::atan2(Zyx.imag(), Zyx.real()) * 180.0 / M_PI;
                 }
                 
-                int out_idx = (ff * NY * NX + j * NX + i) * 2;
+                int out_idx = (ff * NX * NY + i * NY + j) * 2;
                 res_ptr[out_idx + 0] = rho_xy;
                 res_ptr[out_idx + 1] = rho_yx;
                 phs_ptr[out_idx + 0] = phi_xy;
@@ -273,6 +320,8 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
     cudaFree(d_csrRowPtr);
     cudaFree(d_csrColInd);
     cudaFree(d_csrVal);
+    destroyBoundaryConditionPlan3D(boundaryPlan);
+    destroy_gpu_bicgstab_context(solverContext);
 
     return std::make_tuple(app_res, phase);
 }

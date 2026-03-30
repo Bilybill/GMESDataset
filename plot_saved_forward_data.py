@@ -132,6 +132,13 @@ def plot_3d_models(save_dir, run_app=False):
     rho = data['rho']
     res = data['res']
     chi = data['chi'] * 1e5  # 放大系数便于成图，与原逻辑一致
+    rho_unit = "g/cm^3"
+    if "rho_unit" in data:
+        rho_unit = data["rho_unit"]
+        if isinstance(rho_unit, np.ndarray):
+            rho_unit = rho_unit.item()
+        if isinstance(rho_unit, bytes):
+            rho_unit = rho_unit.decode("utf-8")
     
     def _safe_clim(vmin, vmax, eps=1e-5):
         return [vmin, vmax] if vmax > vmin else [vmin, vmax + eps]
@@ -153,7 +160,7 @@ def plot_3d_models(save_dir, run_app=False):
         savename=out_file_3d, 
         savedir=fig_dir, 
         run_app=run_app, 
-        title=["Loaded Vp (m/s)", "Loaded Density (kg/m^3)", "Loaded log10(Resistivity)", "Loaded Susceptibility (x1e-5)"]
+        title=["Loaded Vp (m/s)", f"Loaded Density ({rho_unit})", "Loaded log10(Resistivity)", "Loaded Susceptibility (x1e-5)"]
     )
     print(f"[+] Reloaded 3D Models -> {os.path.join(fig_dir, out_file_3d)}")
 

@@ -7,6 +7,9 @@
 #include <chrono>
 #include <algorithm>
 
+#include <cuda_runtime.h>
+#include <cuComplex.h>
+
 #include "../include/mesh3d.h"
 #include "../include/femAssemble3d.h"
 #include "../include/boundaryConditions3d.h"
@@ -81,9 +84,25 @@ std::vector<SurfaceField> computeSurfaceFields(const HostMesh3D& mesh, double fr
     return fields;
 }
 
+extern "C" void gpu_femAssemble3D_Matrix(
+    int NE, int NX, int NY,
+    const double* d_hx, const double* d_hy, const double* d_hz,
+    const double* d_rho, double freq,
+    const int* d_ME_Edges,
+    const int* d_csrRowPtr, const int* d_csrColInd, 
+    cuDoubleComplex* d_csrVal, int nnz);
+
 int main(int argc, char *argv[]) {
     if (argc < 8) {
-        std::cerr << "Usage: " << argv[0] << " <rhofilename> <NX> <NY> <NZ> <dx> <dy> <dz> [f_min] [f_max] [bg_rho]\n";
+        std::cerr << "Usage: " << argv[0] << " <rhofilename> <NX> <NY> <NZ> <dx> <dy> <dz> [f_min] [f_max] [bg_rho] [padding_layers] [padding_alpha]\n";
+        return 1;
+    }
+
+    int device_count = 0;
+    cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
+    if (cuda_status != cudaSuccess || device_count <= 0) {
+        std::cerr << "Error: emforward3d requires a working CUDA runtime and at least one visible GPU. "
+                  << "cudaGetDeviceCount failed with: " << cudaGetErrorString(cuda_status) << "\n";
         return 1;
     }
     
@@ -98,15 +117,29 @@ int main(int argc, char *argv[]) {
     double f_min = -1.0;
     double f_max = -1.0;
     double bg_rho_for_bc = -1.0; 
+    int npad = 10;
+    double alpha = 1.4;
 
     if (argc >= 10) {
         f_min = std::atof(argv[8]);
         f_max = std::atof(argv[9]);
     }
     if (argc >= 11) bg_rho_for_bc = std::atof(argv[10]);
+    if (argc >= 12) npad = std::atoi(argv[11]);
+    if (argc >= 13) alpha = std::atof(argv[12]);
+
+    if (npad <= 0) {
+        std::cerr << "Error: padding_layers must be positive.\n";
+        return 1;
+    }
+    if (alpha <= 1.0) {
+        std::cerr << "Error: padding_alpha must be greater than 1.0.\n";
+        return 1;
+    }
 
     std::cout << "3D MT Forward Modeling Started (Right-Preconditioned BiCGStab)...\n";
     std::cout << "Mesh: " << NX << "x" << NY << "x" << NZ << ", Cell: " << dx << "x" << dy << "x" << dz << " m\n";
+    std::cout << "Padding: layers=" << npad << ", alpha=" << alpha << "\n";
 
     int NE = NX * NY * NZ;
     std::vector<double> rho_vec(NE, 100.0);
@@ -146,9 +179,6 @@ int main(int argc, char *argv[]) {
     // ========================================================
     // 💡 工业级黑魔法：在内存中自动构建外延 Padding
     // ========================================================
-    int npad = 10;          // 往四周扩展 10 层
-    double alpha = 1.4;     // 每层放大 1.4 倍
-    
     int NX_pad = NX + 2 * npad;
     int NY_pad = NY + 2 * npad;
     int NZ_pad = NZ + npad; // 地表之上无空气层，只往下扩展 Z
@@ -186,7 +216,7 @@ int main(int argc, char *argv[]) {
     if (f_min <= 0.0 || f_max <= 0.0) {
         double skin_depth_min = dz * 2.0;                
         double total_depth = NZ * dz;
-        double skin_depth_max = total_depth * 10;         
+        double skin_depth_max = total_depth / 3.0;         
 
         f_max = bg_rho_for_bc * std::pow(503.0 / skin_depth_min, 2.0);
         f_min = bg_rho_for_bc * std::pow(503.0 / skin_depth_max, 2.0);
@@ -224,12 +254,47 @@ int main(int argc, char *argv[]) {
 
     std::ofstream fout_res("apparent_res_3d.txt");
     std::ofstream fout_phs("phase_3d.txt");
+    std::ofstream fout_timing("solver_timing_3d.txt");
+    fout_timing << "frequency_hz,assembly_s,csr_copy_s,bc_pol1_s,solve_pol1_s,restore_s,bc_pol2_s,solve_pol2_s,pol1_iter,pol1_residual,pol2_iter,pol2_residual\n";
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // 依然保留极其重要的频率级联 (Warm Start)
     std::vector<std::complex<double>> x_pol1(NDoF, {0.0, 0.0});
     std::vector<std::complex<double>> x_pol2(NDoF, {0.0, 0.0});
+
+    std::vector<std::complex<double>> dummy_csrVal;
+    std::vector<int> h_csrColInd, h_csrRowPtr;
+    femAssemble3D_Matrix(mesh, 1.0, rho_pad, dummy_csrVal, h_csrColInd, h_csrRowPtr);
+    int nnz = dummy_csrVal.size();
+
+    double *d_hx, *d_hy, *d_hz, *d_rho;
+    int *d_ME_Edges, *d_csrRowPtr, *d_csrColInd;
+    cuDoubleComplex *d_csrVal;
+
+    cudaMalloc(&d_hx, mesh.NX * sizeof(double));
+    cudaMalloc(&d_hy, mesh.NY * sizeof(double));
+    cudaMalloc(&d_hz, mesh.NZ * sizeof(double));
+    cudaMalloc(&d_rho, mesh.NE * sizeof(double));
+    cudaMalloc(&d_ME_Edges, mesh.ME_Edges.size() * sizeof(int));
+    cudaMalloc(&d_csrRowPtr, h_csrRowPtr.size() * sizeof(int));
+    cudaMalloc(&d_csrColInd, h_csrColInd.size() * sizeof(int));
+    cudaMalloc(&d_csrVal, nnz * sizeof(cuDoubleComplex));
+
+    cudaMemcpy(d_hx, mesh.hx.data(), mesh.NX * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hy, mesh.hy.data(), mesh.NY * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hz, mesh.hz.data(), mesh.NZ * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rho, rho_pad.data(), mesh.NE * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ME_Edges, mesh.ME_Edges.data(), mesh.ME_Edges.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csrRowPtr, h_csrRowPtr.data(), h_csrRowPtr.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csrColInd, h_csrColInd.data(), h_csrColInd.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+    GpuBiCGStabContext* solverContext = create_gpu_bicgstab_context(NDoF, nnz);
+    BoundaryConditionPlan* boundaryPlan = createBoundaryConditionPlan3D(mesh, h_csrColInd, h_csrRowPtr);
+    std::vector<int> modifiedValueIndices;
+    getBoundaryConditionModifiedValueIndices3D(boundaryPlan, modifiedValueIndices);
+    std::vector<std::complex<double>> csrVal_work(nnz);
+    std::vector<std::complex<double>> b_work(NDoF);
 
     for (int ff = 0; ff < n_freqs; ff++) {
         double freq = freqs[ff];
@@ -238,28 +303,73 @@ int main(int argc, char *argv[]) {
         double w = 2.0 * M_PI * freq;
         double mu = 4e-7 * M_PI;
 
-        std::vector<std::complex<double>> csrVal_base;
-        std::vector<int> csrColInd, csrRowPtr;
-        femAssemble3D_Matrix(mesh, freq, rho_pad, csrVal_base, csrColInd, csrRowPtr); // 💡 传入 rho_pad
+        auto assembly_start = std::chrono::high_resolution_clock::now();
+        gpu_femAssemble3D_Matrix(mesh.NE, mesh.NX, mesh.NY, d_hx, d_hy, d_hz, d_rho, freq, d_ME_Edges, d_csrRowPtr, d_csrColInd, d_csrVal, nnz);
+        auto assembly_end = std::chrono::high_resolution_clock::now();
+
+        std::vector<std::complex<double>> csrVal_base(nnz);
+        auto copy_start = std::chrono::high_resolution_clock::now();
+        cudaMemcpy(csrVal_base.data(), d_csrVal, nnz * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+        auto copy_end = std::chrono::high_resolution_clock::now();
+        csrVal_work = csrVal_base;
+
+        std::vector<int>& csrColInd = h_csrColInd;
+        std::vector<int>& csrRowPtr = h_csrRowPtr;
 
         // --- 极化 1 (Ex主导) ---
-        std::vector<std::complex<double>> csrVal_pol1 = csrVal_base; 
-        std::vector<std::complex<double>> b_pol1(NDoF);
-        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_pol1, csrColInd, csrRowPtr, b_pol1, 1);
+        auto bc_start_pol1 = std::chrono::high_resolution_clock::now();
+        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_work, csrColInd, csrRowPtr, b_work, 1, boundaryPlan);
+        auto bc_end_pol1 = std::chrono::high_resolution_clock::now();
         
         std::cout << "  -> Solving Polarization 1 (Ex) using BiCGStab..." << std::endl;
-        // 核心修改：Tolerance 调整为 1e-7，截断无效震荡
-        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_pol1, b_pol1, x_pol1, 1e-7, 50000);
+        auto solve_start_pol1 = std::chrono::high_resolution_clock::now();
+        SolverStats pol1Stats;
+        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_work, b_work, x_pol1, 1e-7, 50000, solverContext, &pol1Stats);
+        auto solve_end_pol1 = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> solve_elapsed_pol1 = solve_end_pol1 - solve_start_pol1;
+        std::cout << "     Polarization 1 stats: iterations=" << pol1Stats.iterations
+                  << ", residual=" << pol1Stats.finalResidual
+                  << ", elapsed=" << solve_elapsed_pol1.count() << " s" << std::endl;
         auto fields_pol1 = computeSurfaceFields(mesh, freq, x_pol1, NX, NY, npad);
 
         // --- 极化 2 (Ey主导) ---
-        std::vector<std::complex<double>> csrVal_pol2 = csrVal_base; 
-        std::vector<std::complex<double>> b_pol2(NDoF);
-        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_pol2, csrColInd, csrRowPtr, b_pol2, 2);
+        auto restore_start = std::chrono::high_resolution_clock::now();
+        for (int idx : modifiedValueIndices) {
+            csrVal_work[idx] = csrVal_base[idx];
+        }
+        auto restore_end = std::chrono::high_resolution_clock::now();
+        auto bc_start_pol2 = std::chrono::high_resolution_clock::now();
+        applyBoundaryConditions3D(mesh, freq, bg_rho_for_bc, csrVal_work, csrColInd, csrRowPtr, b_work, 2, boundaryPlan);
+        auto bc_end_pol2 = std::chrono::high_resolution_clock::now();
         
         std::cout << "  -> Solving Polarization 2 (Ey) using BiCGStab..." << std::endl;
-        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_pol2, b_pol2, x_pol2, 1e-7, 50000);
+        auto solve_start_pol2 = std::chrono::high_resolution_clock::now();
+        SolverStats pol2Stats;
+        gpu_complex_solver_bicgstab(NDoF, csrRowPtr, csrColInd, csrVal_work, b_work, x_pol2, 1e-7, 50000, solverContext, &pol2Stats);
+        auto solve_end_pol2 = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> solve_elapsed_pol2 = solve_end_pol2 - solve_start_pol2;
+        std::cout << "     Polarization 2 stats: iterations=" << pol2Stats.iterations
+                  << ", residual=" << pol2Stats.finalResidual
+                  << ", elapsed=" << solve_elapsed_pol2.count() << " s" << std::endl;
         auto fields_pol2 = computeSurfaceFields(mesh, freq, x_pol2, NX, NY, npad);
+
+        std::chrono::duration<double> assembly_elapsed = assembly_end - assembly_start;
+        std::chrono::duration<double> copy_elapsed = copy_end - copy_start;
+        std::chrono::duration<double> bc_elapsed_pol1 = bc_end_pol1 - bc_start_pol1;
+        std::chrono::duration<double> restore_elapsed = restore_end - restore_start;
+        std::chrono::duration<double> bc_elapsed_pol2 = bc_end_pol2 - bc_start_pol2;
+        fout_timing << freq << ","
+                    << assembly_elapsed.count() << ","
+                    << copy_elapsed.count() << ","
+                    << bc_elapsed_pol1.count() << ","
+                    << solve_elapsed_pol1.count() << ","
+                    << restore_elapsed.count() << ","
+                    << bc_elapsed_pol2.count() << ","
+                    << solve_elapsed_pol2.count() << ","
+                    << pol1Stats.iterations << ","
+                    << pol1Stats.finalResidual << ","
+                    << pol2Stats.iterations << ","
+                    << pol2Stats.finalResidual << "\n";
 
         // 计算张量阻抗与视电阻率
         for (int i = 0; i < NX * NY; ++i) {
@@ -284,6 +394,18 @@ int main(int argc, char *argv[]) {
 
     fout_res.close();
     fout_phs.close();
+    fout_timing.close();
+
+    cudaFree(d_hx);
+    cudaFree(d_hy);
+    cudaFree(d_hz);
+    cudaFree(d_rho);
+    cudaFree(d_ME_Edges);
+    cudaFree(d_csrRowPtr);
+    cudaFree(d_csrColInd);
+    cudaFree(d_csrVal);
+    destroyBoundaryConditionPlan3D(boundaryPlan);
+    destroy_gpu_bicgstab_context(solverContext);
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;

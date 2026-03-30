@@ -85,7 +85,7 @@ The table below summarizes the typical physical property variations for implemen
 | **Gas Hydrate** | **High** (Hydrate ~3700 m/s) <br> *Free Gas Below: Low* | **Low** | **High** | **Low** |
 | **Brine Fault Zone** | **Low/Neutral** <br> (0% to -4% if fractured) | **Neutral/Low** | **Very Low** (Conductive) <br> *(Core ~0.5 $\Omega\cdot m$)* | **Neutral** |
 | **Serpentinized Zone** | **Low** (-25%) | **Low** (-12%) | **Variable** | **High** (+0.02 SI) <br> *(Magnetite production)* |
-| **Salt Dome** | **High** (~4500-5500 m/s) | **Low** (~2100-2200 kg/m^3) | **Very High** | **Low** (Diamagnetic) |
+| **Salt Dome** | **High** (~4500-5500 m/s) | **Low** (~2.10-2.20 g/cm^3) | **Very High** | **Low** (Diamagnetic) |
 | **Sediment** | Background Trend | Background Trend | Background Trend | Background Trend |
 
 > **Note**: Properties can be customized via config files or directly in `core/anomalies/*.py`. Reference physics logic: [GPT-4 Context](https://chatgpt.com/s/t_6988301699188191aa2a68b0f53dbecf).

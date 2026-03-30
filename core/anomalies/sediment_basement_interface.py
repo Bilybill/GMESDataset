@@ -29,7 +29,7 @@ Outputs
 - apply_to_vp(vp_bg, X, Y, Z): returns vp with basement enforced (mode configurable)
 - soft_mask(X,Y,Z): basement soft mask (0..1)
 - build_property_models(X,Y,Z, vp_bg=None): returns dict with
-    rho / rho_kgm3, resist_ohmm, chi_SI, facies_label (1 sediment / 2 basement / 3 interface band),
+    rho, resist_ohmm, chi_SI, facies_label (1 sediment / 2 basement / 3 interface band),
     z_interface_xy (nx,ny)
 
 Integration
@@ -192,7 +192,7 @@ class SedimentBasementParams:
     vp_sed_scale_m: float = 1600.0
     vp_sed_lateral_frac: float = 0.03  # small lateral variations (fraction)
 
-    # Density params are kept in g/cc for backward compatibility and converted to kg/m^3 in outputs.
+    # Density params in g/cm^3.
     rho_sed0_gcc: float = 1.95
     rho_sed_inf_gcc: float = 2.45
     rho_sed_scale_m: float = 2200.0
@@ -247,11 +247,19 @@ class SedimentBasementInterface(Anomaly):
         return m_b
 
     def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
+        out_dict = {k: v.copy() for k, v in props_dict.items()}
         vp_bg = props_dict.get('vp')
+        multiprops = self.build_property_models(X, Y, Z, vp_bg=vp_bg)
+
         if vp_bg is not None:
-            vp_new, _, _ = self._compute_full(vp_bg=vp_bg, X=X, Y=Y, Z=Z, only_mask=False)
-            props_dict['vp'] = vp_new
-        return props_dict
+            out_dict['vp'] = self.apply_to_vp(vp_bg, X, Y, Z)
+        if 'rho' in out_dict:
+            out_dict['rho'] = multiprops['rho'].astype(np.float32, copy=False)
+        if 'resist' in out_dict:
+            out_dict['resist'] = multiprops['resist_ohmm'].astype(np.float32, copy=False)
+        if 'chi' in out_dict:
+            out_dict['chi'] = multiprops['chi_SI'].astype(np.float32, copy=False)
+        return out_dict
 
     def apply_to_vp(self, vp_bg: np.ndarray, X, Y, Z) -> np.ndarray:
         vp_new, _, _ = self._compute_full(vp_bg=vp_bg, X=X, Y=Y, Z=Z, only_mask=False)
@@ -265,7 +273,7 @@ class SedimentBasementInterface(Anomaly):
     ) -> Dict[str, np.ndarray]:
         """
         Returns:
-                    rho, rho_kgm3, resist_ohmm, chi_SI, facies_label, z_interface_xy
+                    rho, resist_ohmm, chi_SI, facies_label, z_interface_xy
         If vp_bg is provided, Vp model will be produced with apply_mode and used as reference,
         otherwise properties follow the param trends.
         """
@@ -359,11 +367,8 @@ class SedimentBasementInterface(Anomaly):
             resist[..., iz] = (1.0 - mb) * resist_sed + mb * resist_base
             chi[..., iz] = (1.0 - mb) * chi_sed + mb * chi_base
 
-        rho_kgm3 = rho_gcc * 1000.0
-
         return {
-            "rho": rho_kgm3,
-            "rho_kgm3": rho_kgm3,
+            "rho": rho_gcc,
             "rho_gcc": rho_gcc,
             "resist_ohmm": resist,
             "chi_SI": chi,

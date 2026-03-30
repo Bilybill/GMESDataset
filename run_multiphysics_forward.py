@@ -6,8 +6,7 @@ import torch
 import segyio
 import matplotlib.pyplot as plt
 
-from core.builder import DatasetBuilder
-from core.petrophysics.rock_physics import PetrophysicsConverter
+from core.multiphysics import build_multiphysics_model
 from core.anomalies.hydrocarbon_hydrate import HydrocarbonHydrate, HydrocarbonHydrateParams
 
 from core.forward_modeling.gravity import GravityForwardSolver
@@ -16,7 +15,14 @@ from core.forward_modeling.electrical import ElectricalForwardSolver
 from core.forward_modeling.seismic import SeismicForwardSolver
 
 
-DENSITY_UNIT = "kg/m^3"
+DENSITY_UNIT = "g/cm^3"
+
+
+def _normalize_density_value_for_pipeline(value):
+    value = float(value)
+    if value > 50.0:
+        return value / 1000.0
+    return value
 
 
 def _conductivity_domain_downsample(res_tensor, target_shape):
@@ -81,44 +87,42 @@ def generate_model(vp_segy_path, label_segy_path):
     )
     anomaly = HydrocarbonHydrate(params=gas_params, layer_labels=label_vol)
     
-    converter = PetrophysicsConverter()
-    rho_bg, res_bg, chi_bg = converter.generate_background(vp_bg, label_vol=label_vol)
-    background_state = converter.get_last_background_state()
-    print(f'背景密度 value range = {rho_bg.min():.2f} - {rho_bg.max():.2f} {DENSITY_UNIT}')
-    print(f'背景电阻率 value range = {res_bg.min():.2e} - {res_bg.max():.2e} Ohm-m')
-    
-    builder = DatasetBuilder(dx, dy, dz)
-    _, mask_final, _, _, _ = builder.inject_anomalies(vp_bg.copy(), [anomaly])
-    mask_bool = mask_final > 0
-    
-    vp_multi, rho_multi, res_multi, chi_multi = converter.apply_anomaly(
-        mask_bool, "Gas", vp_bg.copy(), rho_bg.copy(), res_bg.copy(), chi_bg.copy()
-    )
-    updated_state = converter.get_last_background_state()
-    return (
-        vp_multi,
-        rho_multi,
-        res_multi,
-        chi_multi,
-        rho_bg,
-        chi_bg,
-        (nx, ny, nz),
-        (dx, dy, dz),
-        background_state["facies"].astype(np.int16) if background_state is not None else None,
-        updated_state["facies"].astype(np.int16) if updated_state is not None else None,
-    )
+    models = build_multiphysics_model(vp_bg, label_vol, [anomaly], dx, dy, dz)
+    print(f'背景密度 value range = {models["rho_bg"].min():.2f} - {models["rho_bg"].max():.2f} {DENSITY_UNIT}')
+    print(f'背景电阻率 value range = {models["resist_bg"].min():.2e} - {models["resist_bg"].max():.2e} Ohm-m')
 
-def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2670.0):
+    return {
+        "vp": models["vp"],
+        "rho": models["rho"],
+        "res": models["resist"],
+        "chi": models["chi"],
+        "rho_bg": models["rho_bg"],
+        "chi_bg": models["chi_bg"],
+        "anomaly_label": models["anomaly_label"],
+        "shape": (nx, ny, nz),
+        "spacing": (dx, dy, dz),
+        "facies_bg": None if models["facies_bg"] is None else models["facies_bg"].astype(np.int16),
+    }
+
+def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67):
     print("====== 1. 模型生成 ======")
-    vp_multi, rho_multi, res_multi, chi_multi, rho_bg_arr, chi_bg_arr, shape, spacing, facies_bg, facies_multi = generate_model(vp_segy_path, label_segy_path)
-    nx, ny, nz = shape
-    dx, dy, dz = spacing
+    gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
+    model = generate_model(vp_segy_path, label_segy_path)
+    vp_multi = model["vp"]
+    rho_multi = model["rho"]
+    res_multi = model["res"]
+    chi_multi = model["chi"]
+    rho_bg_arr = model["rho_bg"]
+    chi_bg_arr = model["chi_bg"]
+    facies_bg = model["facies_bg"]
+    nx, ny, nz = model["shape"]
+    dx, dy, dz = model["spacing"]
     print(f"Generated Models: {nx}x{ny}x{nz} (dx={dx}, dy={dy}, dz={dz})")
     
     # 保存生成的物性模型本身供独立制图或检验
     np.savez(os.path.join(save_dir, "forward_models.npz"), 
              vp=vp_multi, rho=rho_multi, res=res_multi, chi=chi_multi,
-             facies_bg=facies_bg, facies=facies_multi,
+             facies_bg=facies_bg, facies=facies_bg, anomaly_label=model["anomaly_label"],
              dx=dx, dy=dy, dz=dz, rho_unit=DENSITY_UNIT)
     
     # 转为 PyTorch Tensor 并放到 GPU (如支持)
@@ -136,14 +140,16 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
             rho_bg_tensor = torch.tensor(rho_bg_arr, dtype=torch.float32, device=device)
             gravity_input_density = rho_tensor - rho_bg_tensor
         elif gravity_anomaly_mode == "constant":
-            print(f"  --> [Gravity Mode]: 'constant'. 计算相对于常数背景密度 ({gravity_bg_density} kg/m^3) 的密度差，以获得相对重力异常。")
+            print(f"  --> [Gravity Mode]: 'constant'. 计算相对于常数背景密度 ({gravity_bg_density} {DENSITY_UNIT}) 的密度差，以获得相对重力异常。")
             gravity_input_density = rho_tensor - gravity_bg_density
         else:
             print("  --> [Gravity Mode]: 'absolute'. 输入绝对密度，计算该有限体积网格产生的绝对重力响应 (gz)。")
             gravity_input_density = rho_tensor
 
         obs_conf_grav = {'layout': 'grid', 'n_x': nx, 'n_y': ny, 'first_x': 0, 'first_y': 0, 'd_x': 1, 'd_y': 1}
-        grav_solver = GravityForwardSolver(dx, dy, dz, heights_m=[0.0], obs_conf=obs_conf_grav, output_unit="mgal").to(device)
+        grav_solver = GravityForwardSolver(
+            dx, dy, dz, heights_m=[0.0], obs_conf=obs_conf_grav, output_unit="mgal", density_unit=DENSITY_UNIT
+        ).to(device)
         t0 = time.time()
         with torch.no_grad():
             grav_data, _ = grav_solver(gravity_input_density)
@@ -251,23 +257,14 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         print(f"[+] Saved downsampled MT model (bin) to: {bin_save_path}")
         raise ValueError("MT Forward not implemented yet. This is a placeholder to ensure the pipeline runs up to MT forward. Please implement MT forward or comment out this raise statement to proceed with the rest of the pipeline.")
 
-        f_min, f_max = 0.01, 1000.0
-        phoenix_coeffs = [8.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0]
-        max_power = int(np.ceil(np.log10(f_max)))
-        min_power = int(np.floor(np.log10(f_min)))
-        freqs = []
-        for p in range(max_power, min_power - 1, -1):
-            power_of_10 = 10.0 ** p
-            for coeff in phoenix_coeffs:
-                current_f = float(coeff * power_of_10)
-                if current_f <= f_max * 1.0001 and current_f >= f_min * 0.9999:
-                    freqs.append(current_f)
-        mt_solver = ElectricalForwardSolver(freqs, mt_dx, mt_dy, mt_dz).to(device)
+        mt_solver = ElectricalForwardSolver(None, mt_dx, mt_dy, mt_dz).to(device)
         t0 = time.time()
         try:
             with torch.no_grad():
                 app_res, phase = mt_solver(res_down.to(torch.float64))
             print(f"MT completed in {time.time()-t0:.2f}s. AppRes shape: {app_res.shape}")
+            if mt_solver.last_freqs is not None:
+                print(f"MT auto-selected {len(mt_solver.last_freqs)} frequencies: {list(mt_solver.last_freqs)}")
             
             # Save MT outputs
             np.save(os.path.join(save_dir, "forward_mt_app_res.npy"), app_res.cpu().numpy())
@@ -321,7 +318,7 @@ if __name__ == '__main__':
     parser.add_argument("--skip_seismic", action="store_true")
     parser.add_argument("--skip_mt", action="store_true")
     parser.add_argument("--anomaly_mode", dest="gravity_anomaly_mode", type=str, default="background", choices=["absolute", "background", "constant"], help="Forward mode for input density/susceptibility: absolute, background, or constant.")
-    parser.add_argument("--bg_density", dest="gravity_bg_density", type=float, default=2670.0, help="Constant bulk density to subtract for 'constant' mode.")
+    parser.add_argument("--bg_density", dest="gravity_bg_density", type=float, default=2.67, help="Constant bulk density in g/cm^3 to subtract for 'constant' mode.")
     args = parser.parse_args()
     
     os.makedirs(args.save_dir, exist_ok=True)

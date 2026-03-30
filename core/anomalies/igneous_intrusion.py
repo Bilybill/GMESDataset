@@ -398,7 +398,7 @@ class IgneousIntrusion(Anomaly):
                         if p.aureole_enable and abs(float(p.aureole_vp_delta_frac)) > 1e-9:
                              out_slice *= (1.0 + float(p.aureole_vp_delta_frac) * m_aur)
                     elif k == 'rho':
-                        out_slice = (1.0 - m_core) * prop_slice + m_core * (1000.0 * float(p.rho_intr_gcc))
+                        out_slice = (1.0 - m_core) * prop_slice + m_core * float(p.rho_intr_gcc)
                         if p.aureole_enable and abs(float(p.aureole_rho_delta_frac)) > 1e-9:
                              out_slice *= (1.0 + float(p.aureole_rho_delta_frac) * m_aur)
                     elif k == 'resist':

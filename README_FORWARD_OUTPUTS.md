@@ -4,7 +4,7 @@
 
 ## 生成的文件：
 1. **地质属性模型 (*.npz)**:
-   - `forward_models.npz`: 含有键 `vp`, `rho`, `res`, `chi` (三维数组) 和标量 `dx`, `dy`, `dz`。其中 `rho` 统一使用 `kg/m^3`。用于后期的 3D 绘图 (如用 cigvis 重新制图)。
+   - `forward_models.npz`: 含有键 `vp`, `rho`, `res`, `chi` (三维数组) 和标量 `dx`, `dy`, `dz`。其中 `rho` 统一使用 `g/cm^3`。用于后期的 3D 绘图 (如用 cigvis 重新制图)。
 
 2. **重力和磁力 (*.npy)**:
    - `forward_gravity.npy`: 二维数组 (nx, ny)，单位 mGal。

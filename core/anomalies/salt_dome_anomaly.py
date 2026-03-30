@@ -127,7 +127,7 @@ class SaltDomeParams:
     Lz: float = 3200.0
 
     # Multi-physics core properties
-    rho_salt_gcc: float = 2.15      # Legacy g/cc param, converted to kg/m^3 for rho grids
+    rho_salt_gcc: float = 2.15      # Salt density in g/cm^3
     resist_salt_ohmm: float = 3000.0 # Highly resistive
     chi_salt_si: float = -0.00001   # Diamagnetic (negative susceptibility)
 
@@ -261,7 +261,7 @@ class SaltDomeAnomaly(Anomaly):
         
         salt_vals = {
             'vp': p.vp_salt_mps,
-            'rho': 1000.0 * p.rho_salt_gcc,
+            'rho': p.rho_salt_gcc,
             'resist': p.resist_salt_ohmm,
             'chi': p.chi_salt_si
         }

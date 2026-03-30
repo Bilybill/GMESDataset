@@ -5,23 +5,23 @@ import torch
 from loguru import logger
 
 
-CANONICAL_DENSITY_UNIT = "kg/m^3"
+CANONICAL_DENSITY_UNIT = "g/cm^3"
 
 
 def _normalize_density_unit(density_unit: str) -> str:
     unit = (density_unit or CANONICAL_DENSITY_UNIT).lower().replace(" ", "")
-    if unit in ["kg/m3", "kg/m^3", "kgm3"]:
+    if unit in ["g/cm3", "g/cm^3", "g/cc", "gcc"]:
         return CANONICAL_DENSITY_UNIT
-    if unit in ["g/cm3", "g/cc", "gcc"]:
-        return "g/cc"
-    raise ValueError(f"Unknown density_unit: {density_unit}. Use 'kg/m^3' or 'g/cm3'.")
+    if unit in ["kg/m3", "kg/m^3", "kgm3"]:
+        return "kg/m^3"
+    raise ValueError(f"Unknown density_unit: {density_unit}. Use 'g/cm^3' or 'kg/m^3'.")
 
 
-def _convert_density_to_kgm3(arr: np.ndarray, density_unit: str) -> np.ndarray:
+def _convert_density_to_gcc(arr: np.ndarray, density_unit: str) -> np.ndarray:
     unit = _normalize_density_unit(density_unit)
     out = arr.astype(np.float32, copy=False)
-    if unit == "g/cc":
-        return out * 1000.0
+    if unit == "kg/m^3":
+        return out / 1000.0
     return out
 
 
@@ -49,7 +49,8 @@ def load_density_model(config: dict, config_path: str) -> torch.Tensor:
     """
     Load density model as torch.Tensor with shape (nx, ny, nz), float32.
 
-    Returned density is always normalized to kg/m^3 for gravity use.
+    Returned density is normalized to g/cm^3.
+    The gravity solver converts it internally to kg/m^3.
 
     Supports:
     - .npy: raw numpy array
@@ -88,7 +89,7 @@ def load_density_model(config: dict, config_path: str) -> torch.Tensor:
     else:
         if shape is None:
             raise FileNotFoundError(f"Density model file not found: {fpath} and model.shape not provided.")
-        default_rho = float(mconf.get("default_density", 2670.0))
+        default_rho = float(mconf.get("default_density", 2.67))
         arr = np.full(tuple(shape), default_rho, dtype=np.float32)
         logger.warning(
             f"Density model not found, using constant density={default_rho} {density_unit}, shape={shape}"
@@ -100,6 +101,12 @@ def load_density_model(config: dict, config_path: str) -> torch.Tensor:
     if shape is not None and tuple(arr.shape) != tuple(shape):
         logger.warning(f"Density shape mismatch: file={arr.shape}, config.shape={shape}. Using file shape.")
 
-    arr = _convert_density_to_kgm3(arr, density_unit)
-    logger.info(f"Density model normalized to {CANONICAL_DENSITY_UNIT} for gravity forward.")
+    if density_unit == CANONICAL_DENSITY_UNIT and float(np.nanmax(arr)) > 50.0:
+        logger.warning(
+            "density_unit is set to g/cm^3 but values look like kg/m^3; auto-converting by /1000 for compatibility."
+        )
+        arr = arr / 1000.0
+
+    arr = _convert_density_to_gcc(arr, density_unit)
+    logger.info(f"Density model normalized to {CANONICAL_DENSITY_UNIT} for project use.")
     return torch.from_numpy(arr.astype(np.float32))

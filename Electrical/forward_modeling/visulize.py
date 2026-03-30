@@ -64,17 +64,17 @@ def load_and_visualize():
     if os.path.exists(app_res_file) and os.path.exists(phase_file):
         print("正在读取视电阻率和相位数据...")
         try:
-            # 格式: (n_freqs, NY * NX * 2)
+            # 格式: (n_freqs, NX * NY * 2)
             data_res = np.loadtxt(app_res_file)
             data_phs = np.loadtxt(phase_file)
 
             n_freq = data_res.shape[0]
 
-            print(f"共读取到 {n_freq} 个频点，正在构建伪 3D 数据体 (Freq, Y, X)...")
+            print(f"共读取到 {n_freq} 个频点，正在构建伪 3D 数据体 (Freq, X, Y)...")
 
-            # 将 (n_freqs, NY * NX * 2) reshape 为 (n_freqs, NY, NX, 2)
-            app_res = data_res.reshape(n_freq, NY, NX, 2)
-            phase = data_phs.reshape(n_freq, NY, NX, 2)
+            # 将 (n_freqs, NX * NY * 2) reshape 为 (n_freqs, NX, NY, 2)
+            app_res = data_res.reshape(n_freq, NX, NY, 2)
+            phase = data_phs.reshape(n_freq, NX, NY, 2)
 
             # 分离 TE (xy) 和 TM (yx) 模式
             rho_xy = app_res[..., 0]
@@ -85,11 +85,11 @@ def load_and_visualize():
             print("启动观测数据 3D 可视化...")
             print("2x2 图分布: 左上 rho_xy, 右上 rho_yx, 左下 phi_xy, 右下 phi_yx")
 
-            # cigvis 通常接收的格式为 (X, Y, Z)，目前 Z 轴(频率) 在最前面，需要转置 (NX, NY, n_freq)
-            rho_xy = np.transpose(rho_xy, (2, 1, 0))
-            rho_yx = np.transpose(rho_yx, (2, 1, 0))
-            phi_xy = np.transpose(phi_xy, (2, 1, 0))
-            phi_yx = np.transpose(phi_yx, (2, 1, 0))
+            # cigvis 通常接收的格式为 (X, Y, Z)，目前频率轴在最前面，需要转置为 (NX, NY, n_freq)
+            rho_xy = np.transpose(rho_xy, (1, 2, 0))
+            rho_yx = np.transpose(rho_yx, (1, 2, 0))
+            phi_xy = np.transpose(phi_xy, (1, 2, 0))
+            phi_yx = np.transpose(phi_yx, (1, 2, 0))
 
             # 计算指定在数据的中心位置创建三个正交切片的坐标
             pos_vol = [rho_xy.shape[0]//2, rho_xy.shape[1]//2, rho_xy.shape[2]//2]

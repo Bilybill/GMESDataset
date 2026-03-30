@@ -26,5 +26,5 @@ if __name__ == "__main__":
     
     # Just print the middle cell result for highest frequency
     mid_x, mid_y = NX // 2, NY // 2
-    print(f"Center cell app_res (xy, yx) at {freqs[0]} Hz: {app_res[0, mid_y, mid_x]}")
-    print(f"Center cell phase (xy, yx) at {freqs[0]} Hz: {phase[0, mid_y, mid_x]}")
+    print(f"Center cell app_res (xy, yx) at {freqs[0]} Hz: {app_res[0, mid_x, mid_y]}")
+    print(f"Center cell phase (xy, yx) at {freqs[0]} Hz: {phase[0, mid_x, mid_y]}")
