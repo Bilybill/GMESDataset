@@ -1,6 +1,3 @@
-from pathlib import Path
-import sys
-
 import torch
 import torch.nn as nn
 
@@ -103,7 +100,7 @@ class MTForward3D(nn.Module):
         if self.freqs:
             freqs = list(self.freqs)
         else:
-            freqs, bg_rho, f_min, f_max = resolve_auto_mt_frequencies(rho_solver_input, self.dz)
+            freqs, _, _, _ = resolve_auto_mt_frequencies(rho_solver_input, self.dz)
 
         self.last_freqs = tuple(freqs)
         app_res, phase = mt_forward_cuda.compute_mt_3d(rho_solver_input, self.dx, self.dy, self.dz, freqs)

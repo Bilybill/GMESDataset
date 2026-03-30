@@ -3,14 +3,10 @@ import os
 import time
 import numpy as np
 import torch
-import segyio
 import matplotlib.pyplot as plt
 
 from core.multiphysics import build_multiphysics_model
-from core.anomalies.igneous_intrusion import IgneousIntrusion, IgneousIntrusionParams
-from core.anomalies.massive_sulfide import MassiveSulfide, MassiveSulfideParams
-from core.anomalies.brine_fault_zone import BrineFaultZone, BrineFaultZoneParams
-from core.anomalies.salt_dome_anomaly import SaltDomeAnomaly
+from core.presets import FORWARD_ANOMALY_TYPES, build_named_anomaly_preset, read_segy_volume
 from Seismic.forward_modeling.utils import get_wavelet, setup_acquisition
 
 from core.forward_modeling.gravity import GravityForwardSolver
@@ -20,9 +16,7 @@ from core.forward_modeling.seismic import SeismicForwardSolver
 
 
 DENSITY_UNIT = "g/cm^3"
-FORWARD_ANOMALY_TYPES = ("igneous_swarm", "massive_sulfide", "brine_fault", "salt_dome")
 SEISMIC_PRESETS = ("full", "light")
-
 
 def _normalize_density_value_for_pipeline(value):
     value = float(value)
@@ -108,6 +102,31 @@ def _apply_boundary_background_taper(res_tensor, edge_cells=4):
     return torch.pow(10.0, blended)
 
 
+def _save_mt_xz_slice(res_tensor, spacing, save_path, log_scale=True):
+    nx, ny, nz = res_tensor.shape
+    dx, _, dz = spacing
+    mid_y = ny // 2
+    slice_xz = res_tensor[:, mid_y, :].detach().cpu().numpy()
+    image = np.log10(slice_xz.T) if log_scale else slice_xz.T
+    colorbar_label = "Log10 Resistivity (Ohm-m)" if log_scale else "Resistivity (Ohm-m)"
+    title_suffix = "log10" if log_scale else "linear"
+
+    plt.figure(figsize=(8, 5))
+    plt.imshow(
+        image,
+        aspect="auto",
+        cmap="jet",
+        extent=[0, nx * dx, nz * dz, 0],
+    )
+    plt.colorbar(label=colorbar_label)
+    plt.title(f"Downsampled MT Resistivity X-Z Slice ({title_suffix}, y={mid_y})")
+    plt.xlabel("X (m)")
+    plt.ylabel("Depth (m)")
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"[+] Saved MT resistivity X-Z slice to: {save_path}")
+
+
 def _build_seismic_3d_config(shape, spacing, preset="full"):
     nx, ny, nz = shape
     dx, dy, dz = spacing
@@ -173,82 +192,6 @@ def _build_seismic_3d_config(shape, spacing, preset="full"):
         },
     }
 
-def read_segy_volume(path):
-    print(f"Reading SEGY: {path}")
-    with segyio.open(path, iline=segyio.TraceField.INLINE_3D, xline=segyio.TraceField.CROSSLINE_3D) as f:
-        try:
-            vol = segyio.tools.cube(f)
-        except Exception:
-            f.mmap()
-            vol = segyio.tools.cube(f)
-    dx, dy, dz = 10.0, 10.0, 25.0
-    return vol, (dx, dy, dz)
-
-def _build_forward_anomaly(anomaly_type, vp_bg, label_vol, spacing):
-    nx, ny, nz = vp_bg.shape
-    dx, dy, dz = spacing
-
-    if anomaly_type == "igneous_swarm":
-        params = IgneousIntrusionParams(
-            kind="swarm",
-            dyke_x0_m=1000.0,
-            dyke_y0_m=1500.0,
-            dyke_z0_m=2500.0,
-            dyke_thickness_m=40.0,
-            dyke_length_m=2500.0,
-            dyke_width_m=3000.0,
-            dyke_strike_deg=45.0,
-            dyke_dip_deg=80.0,
-            swarm_count=5,
-            swarm_spacing_m=300.0,
-            swarm_fan_deg=15.0,
-            vp_intr_mps=5000.0,
-            aureole_enable=True,
-        )
-        return (
-            IgneousIntrusion(params=params, layer_labels=None, rng_seed=101),
-            "Igneous Swarm",
-            "岩墙群",
-        )
-
-    if anomaly_type == "massive_sulfide":
-        params = MassiveSulfideParams(
-            layer_id=-1,
-            center_x_m=1000.0,
-            center_y_m=1000.0,
-            lens_extent_x_m=600.0,
-            lens_extent_y_m=500.0,
-            lens_thickness_m=150.0,
-        )
-        return (
-            MassiveSulfide(params=params, layer_labels=label_vol),
-            "Massive Sulfide",
-            "块状硫化物",
-        )
-
-    if anomaly_type == "brine_fault":
-        params = BrineFaultZoneParams(
-            top_k=2,
-            fault_quantile=0.996,
-            core_thickness_m=40.0,
-        )
-        return (
-            BrineFaultZone(params=params, vp_ref=vp_bg, rng_seed=999),
-            "Brine Fault",
-            "含卤水断层",
-        )
-
-    if anomaly_type == "salt_dome":
-        params = SaltDomeAnomaly.create_random_params((nx, ny, nz), (dx, dy, dz), seed=333)
-        return (
-            SaltDomeAnomaly(type="salt_dome", strength=0.0, edge_width_m=20.0, params=params, rng_seed=333),
-            "Salt Dome",
-            "盐丘",
-        )
-
-    raise ValueError(f"Unsupported anomaly type: {anomaly_type}")
-
-
 def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
     """读取 SEGY 构建指定异常体的四参数模型，用于四法联合正演基准。"""
     try:
@@ -259,15 +202,10 @@ def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
     except Exception as e:
         raise RuntimeError(f"Failed to read SEGY volumes: {e}")
 
-    anomaly, anomaly_name_en, anomaly_name_zh = _build_forward_anomaly(
-        anomaly_type,
-        vp_bg,
-        label_vol,
-        (dx, dy, dz),
-    )
-    print(f"Selected anomaly: {anomaly_name_en} ({anomaly_name_zh}) [{anomaly_type}]")
+    preset = build_named_anomaly_preset(anomaly_type, vp_bg, label_vol, (dx, dy, dz))
+    print(f"Selected anomaly: {preset.name_en} ({preset.name_zh}) [{preset.key}]")
 
-    models = build_multiphysics_model(vp_bg, label_vol, [anomaly], dx, dy, dz)
+    models = build_multiphysics_model(vp_bg, label_vol, [preset.anomaly], dx, dy, dz)
     print(f'背景密度 value range = {models["rho_bg"].min():.2f} - {models["rho_bg"].max():.2f} {DENSITY_UNIT}')
     print(f'背景电阻率 value range = {models["resist_bg"].min():.2e} - {models["resist_bg"].max():.2e} Ohm-m')
 
@@ -282,9 +220,9 @@ def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
         "shape": (nx, ny, nz),
         "spacing": (dx, dy, dz),
         "facies_bg": None if models["facies_bg"] is None else models["facies_bg"].astype(np.int16),
-        "anomaly_type": anomaly_type,
-        "anomaly_name_en": anomaly_name_en,
-        "anomaly_name_zh": anomaly_name_zh,
+        "anomaly_type": preset.key,
+        "anomaly_name_en": preset.name_en,
+        "anomaly_name_zh": preset.name_zh,
     }
 
 def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full"):
@@ -356,39 +294,18 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         print(f"Down sampled res value range : {res_down.min().item():.2e} - {res_down.max().item():.2e} Ohm-m")
         print(f"Down sampled res median / p95 : {torch.median(res_down).item():.2e} / {torch.quantile(res_down, 0.95).item():.2e} Ohm-m")
 
-        # 可视化 x-z 剖面 (y轴中心) 检查电阻率模型是否合理
-        plt.figure(figsize=(8, 5))
-        # res_down 形状为 (nx, ny, nz)
-        mid_y = target_shape[1] // 2
-        slice_xz = res_down[:, mid_y, :].cpu().numpy()
-        # 为了符合常规的地质剖面视角 (Z轴向下)，将其转置并设置 extent
-        plt.imshow(np.log10(slice_xz.T), aspect='auto', cmap='jet', 
-                   extent=[0, target_shape[0]*mt_dx, target_shape[2]*mt_dz, 0])
-        plt.colorbar(label='Log10 Resistivity (Ohm-m)')
-        plt.title(f'Downsampled MT Resistivity X-Z Slice (y={mid_y})')
-        plt.xlabel('X (m)')
-        plt.ylabel('Depth (m)')
-        slice_save_path = os.path.join(save_dir, "mt_res_downsampled_xz_slice.png")
-        plt.savefig(slice_save_path, dpi=150)
-        plt.close()
-        print(f"[+] Saved MT resistivity X-Z slice to: {slice_save_path}")
-        
-        # 可视化 x-z 剖面 (y轴中心) 检查电阻率模型是否合理
-        plt.figure(figsize=(8, 5))
-        # res_down 形状为 (nx, ny, nz)
-        mid_y = target_shape[1] // 2
-        slice_xz = res_down[:, mid_y, :].cpu().numpy()
-        # 为了符合常规的地质剖面视角 (Z轴向下)，将其转置并设置 extent
-        plt.imshow(slice_xz.T, aspect='auto', cmap='jet', 
-                   extent=[0, target_shape[0]*mt_dx, target_shape[2]*mt_dz, 0])
-        plt.colorbar(label='Resistivity (Ohm-m)')
-        plt.title(f'Downsampled MT Resistivity X-Z Slice (y={mid_y})')
-        plt.xlabel('X (m)')
-        plt.ylabel('Depth (m)')
-        slice_save_path = os.path.join(save_dir, "mt_res_downsampled_xz_slice——nolog.png")
-        plt.savefig(slice_save_path, dpi=150)
-        plt.close()
-        print(f"[+] Saved MT resistivity X-Z slice to: {slice_save_path}")
+        _save_mt_xz_slice(
+            res_down,
+            (mt_dx, mt_dy, mt_dz),
+            os.path.join(save_dir, "mt_res_downsampled_xz_slice.png"),
+            log_scale=True,
+        )
+        _save_mt_xz_slice(
+            res_down,
+            (mt_dx, mt_dy, mt_dz),
+            os.path.join(save_dir, "mt_res_downsampled_xz_slice_linear.png"),
+            log_scale=False,
+        )
 
         # # 将降采样后的三维电阻率模型保存为 bin 文件，供独立 MTForward3D 项目测试和定位不收敛问题
         # bin_save_path = os.path.join(save_dir, f"downsampled_mt_model_{target_shape[0]}x{target_shape[1]}x{target_shape[2]}.bin")

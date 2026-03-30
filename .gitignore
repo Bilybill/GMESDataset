@@ -7,3 +7,9 @@ cache
 build
 *.egg-info
 *.npy
+*.npz
+*.so
+*.log
+dist
+outputs
+DATAFOLDER/Cache

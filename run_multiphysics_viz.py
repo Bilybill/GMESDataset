@@ -1,32 +1,13 @@
 import os
-import sys
 import numpy as np
-import segyio
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 import cigvis
 
 from core.multiphysics import build_multiphysics_model
-from core.anomalies.igneous_intrusion import IgneousIntrusion, IgneousIntrusionParams
-from core.anomalies.hydrocarbon_hydrate import HydrocarbonHydrate, HydrocarbonHydrateParams
-from core.anomalies.brine_fault_zone import BrineFaultZone, BrineFaultZoneParams
-from core.anomalies.sediment_basement_interface import SedimentBasementInterface, SedimentBasementParams
-from core.anomalies.serpentinized_zone import SerpentinizedZone, SerpentinizedZoneParams
-from core.anomalies.massive_sulfide import MassiveSulfide, MassiveSulfideParams
-from core.anomalies.salt_dome_anomaly import SaltDomeAnomaly, SaltDomeParams
-
-def read_segy_volume(path):
-    print(f"Reading SEGY: {path}")
-    with segyio.open(path, iline=segyio.TraceField.INLINE_3D, xline=segyio.TraceField.CROSSLINE_3D) as f:
-        try:
-            vol = segyio.tools.cube(f)
-        except Exception:
-            f.mmap()
-            vol = segyio.tools.cube(f)
-    dx, dy, dz = 10.0, 10.0, 25.0
-    return vol, (dx, dy, dz)
+from core.presets import build_default_viz_presets, read_segy_volume
+from core.viz_utils import extract_subtype_labels
 
 def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, vp_bg, label_vol, dx, dy, dz, run_app=False, show_colorbar=True):
     """
@@ -83,48 +64,7 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
     nodes_chi = cigvis.create_slices(chi_multi_scaled, cmap='jet', clim=clim_chi)
     
     # ---------------- 异常体可视化 ----------------
-    sub_labels = None
-    try:
-        if hasattr(anomaly, "subtype_labels"):
-            sub_labels = anomaly.subtype_labels(X, Y, Z)
-            if anomaly.type == "brine_fault_zone":
-                viz_sub = np.zeros_like(sub_labels)
-                viz_sub[(sub_labels >= 1) & (sub_labels < 10)] = 21 
-                viz_sub[sub_labels >= 10] = 22 
-                sub_labels = viz_sub
-        elif hasattr(anomaly, "build_property_models"):
-            multiprops = anomaly.build_property_models(X, Y, Z, vp_bg=vp_bg)
-            if anomaly.type == "sediment_basement_interface":
-                facies_sbi = multiprops.get("facies_label", None)
-                if facies_sbi is not None:
-                    viz_sub = np.zeros_like(facies_sbi)
-                    viz_sub[facies_sbi == 2] = 30
-                    viz_sub[facies_sbi == 3] = 31
-                    sub_labels = viz_sub
-            elif anomaly.type == "serpentinized_zone":
-                sub_labels = multiprops.get("subtype", None)
-        else:
-            sub_labels = mask_final
-    except Exception as e:
-        print(f"Warning: Could not extract specific subtypes: {e}")
-        sub_labels = mask_final
-
-    if sub_labels is None:
-        sub_labels = mask_final
-
-    sub_colors = {
-        1: 'red',      # GasLens / Core
-        2: 'yellow',   # GasChimney
-        3: 'cyan',     # HydrateLayer
-        4: 'orange',   # FreeGasBelow
-        5: 'gray',     # Halo 
-        21: 'magenta', # BrineCore
-        22: 'purple',  # BrineDamage
-        30: 'brown',   # Basement
-        31: 'green',   # Interface
-        40: 'blue',    # SerpCore
-        41: 'teal'     # SerpHalo
-    }
+    sub_labels = extract_subtype_labels(anomaly, X, Y, Z, mask_final, vp_bg=vp_bg)
     
     if sub_labels is not None and len(np.unique(sub_labels)) > 1:
         for code in np.unique(sub_labels):
@@ -207,77 +147,20 @@ def main():
     except Exception as e:
         raise RuntimeError(f"Failed to read SEGY volumes: {e}")
 
-    # 1. Dyke Swarm -> Igneous
-    swarm_params = IgneousIntrusionParams(
-        kind="swarm", dyke_x0_m=1000.0, dyke_y0_m=1500.0, dyke_z0_m=2500.0,
-        dyke_thickness_m=40.0, dyke_length_m=2500.0, dyke_width_m=3000.0,
-        dyke_strike_deg=45.0, dyke_dip_deg=80.0, swarm_count=5, swarm_spacing_m=300.0,
-        swarm_fan_deg=15.0, vp_intr_mps=5000.0, aureole_enable=True
-    )
-    generate_multiphysics_and_plot(
-        IgneousIntrusion(params=swarm_params, layer_labels=None, rng_seed=101),
-        "Igneous", "Igneous_Swarm", "岩墙群", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
-    
-    # 2. Gas Reservoir -> Gas
-    gas_params = HydrocarbonHydrateParams(
-        kind="gas", layer_id=-1, center_x_m=1500.0, center_y_m=1500.0,
-        lens_extent_x_m=1200.0, lens_extent_y_m=700.0, lens_thickness_m=120.0, vp_gas_mps=1800.0,
-        gas_enable_chimney=True, chimney_height_m=1200.0, rng_seed=11
-    )
-    generate_multiphysics_and_plot(
-        HydrocarbonHydrate(params=gas_params, layer_labels=label_vol),
-        "Gas", "Hydrocarbon_Gas", "气藏", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
-
-    # 3. Gas Hydrate -> Hydrate
-    hyd_params = HydrocarbonHydrateParams(
-        kind="hydrate", layer_id=-1, center_x_m=2000.0, center_y_m=2000.0,
-        hydrate_offset_above_m=40.0, hydrate_thickness_m=70.0, vp_hydrate_mps=3800.0,
-        hard_gate_to_layer=True, hydrate_enable_patchy=False, rng_seed=22
-    )
-    generate_multiphysics_and_plot(
-        HydrocarbonHydrate(params=hyd_params, layer_labels=label_vol),
-        "Hydrate", "Hydrocarbon_Hydrate", "天然气水合物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
-
-    # 4. Brine Fault Zone -> BrineFault
-    brine_params = BrineFaultZoneParams(top_k=2, fault_quantile=0.996, core_thickness_m=40.0)
-    generate_multiphysics_and_plot(
-        BrineFaultZone(params=brine_params, vp_ref=vp_bg, rng_seed=999),
-        "BrineFault", "Brine_Fault", "含卤水断层", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
-
-    # 5. Massive Sulfide -> Sulfide
-    mass_sulfide_params = MassiveSulfideParams(
-        layer_id=-1, center_x_m=1000.0, center_y_m=1000.0, lens_extent_x_m=600.0, lens_extent_y_m=500.0,
-        lens_thickness_m=150.0
-    )
-    generate_multiphysics_and_plot(
-        MassiveSulfide(params=mass_sulfide_params, layer_labels=label_vol),
-        "Sulfide", "Massive_Sulfide", "块状硫化物", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
-    
-    # 6. Salt Dome -> SaltDome
-    salt_params = SaltDomeAnomaly.create_random_params((nx, ny, nz), (dx, dy, dz), seed=333)
-    salt_dome = SaltDomeAnomaly(type="salt_dome", strength=0.0, edge_width_m=20.0, params=salt_params, rng_seed=333)
-    generate_multiphysics_and_plot(
-        salt_dome, "SaltDome", "Salt_Dome", "盐丘", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
-    
-    # 7. Sediment Basement Interface -> Basement
-    base_params = SedimentBasementParams()
-    generate_multiphysics_and_plot(
-        SedimentBasementInterface(params=base_params, layer_labels=label_vol),
-        "Basement", "Sediment_Basement", "沉积-基底界面", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
-
-    # 8. Serpentinized Zone -> Serpentinized
-    serp_params = SerpentinizedZoneParams()
-    generate_multiphysics_and_plot(
-        SerpentinizedZone(params=serp_params, layer_labels=label_vol),
-        "Serpentinized", "Serpentinized_Zone", "蛇纹石化带", vp_bg, label_vol, dx, dy, dz, run_app=args.run_app, show_colorbar=not args.hide_colorbar
-    )
+    for preset in build_default_viz_presets(vp_bg, label_vol, (dx, dy, dz), include_stock=False):
+        generate_multiphysics_and_plot(
+            preset.anomaly,
+            preset.key,
+            preset.name_en,
+            preset.name_zh,
+            vp_bg,
+            label_vol,
+            dx,
+            dy,
+            dz,
+            run_app=args.run_app,
+            show_colorbar=not args.hide_colorbar,
+        )
 
 if __name__ == '__main__':
     main()
