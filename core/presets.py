@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Callable
+import numpy as np
 
 try:
     import segyio
@@ -64,21 +65,48 @@ def read_segy_volume(path, spacing=DEFAULT_SEGY_SPACING, verbose=True):
 
 
 def _build_igneous_swarm(ctx: PresetBuildContext):
+    nx, ny, nz = ctx.shape
+    dx, dy, dz = ctx.spacing
+    x_span_m = max((nx - 1) * dx, dx)
+    y_span_m = max((ny - 1) * dy, dy)
+    z_span_m = max((nz - 1) * dz, dz)
+    center_x_m = 0.5 * x_span_m
+    center_y_m = 0.5 * y_span_m
+    lateral_span_m = max(x_span_m, y_span_m)
+    swarm_count = int(np.clip(round(min(x_span_m, y_span_m) / 220.0), 7, 12))
+    spacing_m = float(np.clip(min(x_span_m, y_span_m) / max(swarm_count + 3, 1), 80.0, 180.0))
+    length_max_m = float(np.clip(lateral_span_m * 0.95, 1800.0, 10000.0))
+    length_min_m = float(np.clip(length_max_m * 0.45, 1000.0, max(length_max_m - 200.0, 1000.0)))
+    vertical_base_m = max(800.0, z_span_m * 0.78)
+    vertical_base_m = float(min(vertical_base_m, z_span_m * 0.95))
     params = IgneousIntrusionParams(
         kind="swarm",
-        dyke_x0_m=1000.0,
-        dyke_y0_m=1500.0,
-        dyke_z0_m=2500.0,
-        dyke_thickness_m=40.0,
-        dyke_length_m=2500.0,
-        dyke_width_m=3000.0,
-        dyke_strike_deg=45.0,
-        dyke_dip_deg=80.0,
-        swarm_count=5,
-        swarm_spacing_m=300.0,
-        swarm_fan_deg=15.0,
+        dyke_x0_m=center_x_m,
+        dyke_y0_m=center_y_m,
+        dyke_z0_m=0.5 * vertical_base_m,
+        dyke_thickness_m=24.0,
+        dyke_length_m=length_max_m,
+        dyke_width_m=vertical_base_m,
+        dyke_strike_deg=35.0,
+        dyke_dip_deg=88.0,
+        swarm_count=swarm_count,
+        swarm_spacing_m=spacing_m,
+        swarm_fan_deg=4.0,
+        swarm_spacing_jitter_frac=0.12,
+        swarm_parallel_jitter_deg=0.8,
+        swarm_dip_jitter_deg=0.6,
+        swarm_thickness_min_m=20.0,
+        swarm_thickness_max_m=30.0,
+        swarm_length_min_m=length_min_m,
+        swarm_length_max_m=length_max_m,
+        swarm_echelon_zone_frac=0.5,
+        swarm_echelon_step_m=spacing_m * 0.8,
+        swarm_top_z_m=0.0,
+        swarm_base_z_m=vertical_base_m,
         vp_intr_mps=5000.0,
         aureole_enable=True,
+        aureole_thickness_m=30.0,
+        edge_width_m=1.5,
     )
     return IgneousIntrusion(params=params, layer_labels=None, rng_seed=101)
 
@@ -151,9 +179,19 @@ def _build_sediment_basement(ctx: PresetBuildContext):
 
 def _build_serpentinized(ctx: PresetBuildContext):
     params = SerpentinizedZoneParams(
-        mode="patchy",
+        mode="corridor",
         use_layer_labels=True,
-        corridor_length_m=2200.0,
+        corridor_length_m=2400.0,
+        corridor_halfwidth_m=180.0,
+        thickness_m=420.0,
+        halo_thickness_m=180.0,
+        fault_gate_radius_m=260.0,
+        matrix_volume_frac=0.60,
+        block_target_frac=0.32,
+        resolved_block_count=28,
+        block_diameter_min_m=5.0,
+        block_diameter_max_m=30.0,
+        vein_spacing_m=48.0,
         rng_seed=1212,
     )
     return SerpentinizedZone(params=params, layer_labels=ctx.label_vol)
@@ -243,6 +281,7 @@ ANOMALY_REGISTRY = (
         name_en="Serpentinized_Zone",
         name_zh="蛇纹岩化带",
         factory=_build_serpentinized,
+        include_in_forward=True,
     ),
 )
 

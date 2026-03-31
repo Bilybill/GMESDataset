@@ -27,15 +27,23 @@ class SeismicForwardSolver(BaseForwardSolver):
         Returns:
             out: Deepwave output dictionary containing 'receiver_amplitudes' and other fields.
         """
+        scalar_kwargs = {
+            "source_amplitudes": self.source_amplitudes,
+            "source_locations": self.source_locations,
+            "receiver_locations": self.receiver_locations,
+            "accuracy": self.accuracy,
+        }
+        if self.pml_freq is not None:
+            scalar_kwargs["pml_freq"] = self.pml_freq
+        # Deepwave expects pml_width to be an int or a sequence of ints; passing
+        # None explicitly raises, while omitting it uses the library default.
+        if self.pml_width is not None:
+            scalar_kwargs["pml_width"] = self.pml_width
+
         out = scalar(
             v,
             self.dx,
             self.dt,
-            source_amplitudes=self.source_amplitudes,
-            source_locations=self.source_locations,
-            receiver_locations=self.receiver_locations,
-            accuracy=self.accuracy,
-            pml_freq=self.pml_freq,
-            pml_width=self.pml_width
+            **scalar_kwargs,
         )
         return out

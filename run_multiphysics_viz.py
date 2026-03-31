@@ -2,12 +2,87 @@ import os
 import numpy as np
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
 
 import cigvis
 
 from core.multiphysics import build_multiphysics_model
 from core.presets import build_default_viz_presets, read_segy_volume
 from core.viz_utils import extract_subtype_labels
+
+def _plot_igneous_swarm_debug_view(anomaly, mask_final, vp_multi, vp_bg, dx, dy, dz, save_dir, name_en, name_zh):
+    if getattr(getattr(anomaly, "params", None), "kind", "") != "swarm":
+        return
+
+    mask_binary = np.asarray(mask_final > 0, dtype=np.float32)
+    if mask_binary.ndim != 3 or not np.any(mask_binary):
+        return
+
+    nx, ny, nz = mask_binary.shape
+    top_nz = max(1, min(nz, int(round(nz * 0.08))))
+    shallow_projection = np.max(mask_binary[:, :, :top_nz], axis=2)
+    footprint_projection = np.max(mask_binary, axis=2)
+    thickness_map_m = mask_binary.sum(axis=2) * float(dz)
+    vp_delta_shallow = np.mean(vp_multi[:, :, :top_nz] - vp_bg[:, :, :top_nz], axis=2)
+
+    x_extent = np.arange(nx) * float(dx)
+    y_extent = np.arange(ny) * float(dy)
+    extent = [float(x_extent[0]), float(x_extent[-1] if nx > 1 else dx), float(y_extent[0]), float(y_extent[-1] if ny > 1 else dy)]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 11), constrained_layout=True)
+    panels = [
+        (shallow_projection.T, "magma", "Shallow Exposure Projection", "Active dyke presence"),
+        (footprint_projection.T, "viridis", "Full Footprint Projection", "Active dyke presence"),
+        (thickness_map_m.T, "plasma", "Integrated Dyke Thickness", "Accumulated thickness (m)"),
+        (vp_delta_shallow.T, "coolwarm", "Shallow Vp Contrast", "Vp anomaly (m/s)"),
+    ]
+
+    # Recreate the dyke list with the original seed so the debug overlay matches
+    # the swarm geometry used during model construction.
+    dyke_pre = anomaly._precompute_dyke_list(anomaly.params, np.random.default_rng(anomaly.rng_seed))
+    dykes = dyke_pre.get("dykes", [])
+
+    for ax, (panel, cmap, title, cbar_label) in zip(axes.flat, panels):
+        im = ax.imshow(panel, origin="lower", extent=extent, cmap=cmap, aspect="equal")
+        plt.colorbar(im, ax=ax, shrink=0.82, label=cbar_label)
+        ax.set_title(f"{title} - {name_zh}")
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+
+        if np.any(footprint_projection > 0):
+            ax.contour(
+                x_extent,
+                y_extent,
+                footprint_projection.T,
+                levels=[0.5],
+                colors="white",
+                linewidths=0.8,
+                alpha=0.8,
+            )
+
+        for idx, dyke in enumerate(dykes):
+            strike_rad = np.deg2rad(float(dyke["strike"]))
+            half_len = 0.5 * float(dyke["len"])
+            cx = float(dyke["x0"])
+            cy = float(dyke["y0"])
+            dx_line = half_len * np.cos(strike_rad)
+            dy_line = half_len * np.sin(strike_rad)
+            color = plt.cm.tab20(idx % 20)
+            ax.plot(
+                [cx - dx_line, cx + dx_line],
+                [cy - dy_line, cy + dy_line],
+                color=color,
+                linewidth=1.2,
+                alpha=0.95,
+            )
+            ax.scatter([cx], [cy], color=color, s=10, alpha=0.95)
+
+    out_file = f"IgneousSwarm_Debug_{name_en}-{name_zh}.png"
+    out_path = os.path.join(save_dir, out_file)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print(f"Saved igneous swarm debug view: {out_path}")
+
 
 def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, vp_bg, label_vol, dx, dy, dz, run_app=False, show_colorbar=True):
     """
@@ -125,6 +200,20 @@ def generate_multiphysics_and_plot(anomaly, anomaly_type_str, name_en, name_zh, 
         title=[f"Vp (m/s) - {name_zh}", f"Density (g/cm^3)", f"log10(Resistivity) (Ohm.m)", f"Susceptibility (x1e-5 SI)"]
     )
     print(f"Saved Multiphysics Visualization: {out_path}")
+
+    if anomaly_type_str == "igneous_swarm":
+        _plot_igneous_swarm_debug_view(
+            anomaly,
+            mask_final,
+            vp_multi,
+            vp_bg,
+            dx,
+            dy,
+            dz,
+            save_dir,
+            name_en,
+            name_zh,
+        )
 
 
 def main():

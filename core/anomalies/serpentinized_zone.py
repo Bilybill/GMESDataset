@@ -421,6 +421,15 @@ def _distance_gate_from_seed(
     return gate
 
 
+def _wrapped_angle_delta(theta_target: np.ndarray, theta_base: np.ndarray) -> np.ndarray:
+    return np.arctan2(np.sin(theta_target - theta_base), np.cos(theta_target - theta_base)).astype(np.float32)
+
+
+def _periodic_line_distance(coord: np.ndarray, spacing_m: float) -> np.ndarray:
+    spacing_m = max(float(spacing_m), 1e-6)
+    return np.abs(((coord + 0.5 * spacing_m) % spacing_m) - 0.5 * spacing_m).astype(np.float32)
+
+
 # -------------------------
 # Params
 # -------------------------
@@ -469,6 +478,30 @@ class SerpentinizedZoneParams:
     edge_width_m: float = 60.0
     halo_thickness_m: float = 220.0  # alteration halo around core (labels and properties)
 
+    # Internal block-in-matrix architecture
+    matrix_volume_frac: float = 0.60
+    block_target_frac: float = 0.32
+    block_diameter_min_m: float = 5.0
+    block_diameter_max_m: float = 30.0
+    resolved_block_count: int = 24
+    block_noise_modes: int = 9
+    block_wrap_strength_deg: float = 26.0
+    foliation_spacing_m: float = 45.0
+    foliation_contrast_frac: float = 0.08
+
+    # Mesh-style vein network (represented as subgrid density on coarse grids)
+    vein_spacing_m: float = 55.0
+    vein_irregularity_frac: float = 0.35
+    vein_width_min_m: float = 0.1
+    vein_width_max_m: float = 1.0
+    vein_intensity_frac: float = 0.55
+    vein_serp_boost_frac: float = 0.12
+
+    # Relative alteration degree by subcomponent
+    block_serp_degree: float = 0.18
+    matrix_serp_degree: float = 1.0
+    vein_serp_degree: float = 1.12
+
     # Property deltas (core)
     # Typical: Vp drop from ~8 km/s to ~5 km/s in mantle contexts
     vp_delta_frac: float = -0.25      # multiply background Vp by (1 + delta) inside core
@@ -481,8 +514,10 @@ class SerpentinizedZoneParams:
     chi_bg_SI: float = 0.001
 
     # Subtype codes (match your demo style; pick unused range)
-    subtype_core: int = 40
+    subtype_matrix: int = 40
     subtype_halo: int = 41
+    subtype_blocks: int = 42
+    subtype_veins: int = 43
 
     rng_seed: int = 123
 
@@ -493,7 +528,7 @@ class SerpentinizedZoneParams:
 
 @dataclass
 class SerpentinizedZone(Anomaly):
-    type: str = "serpentinized"
+    type: str = "serpentinized_zone"
     strength: float = 0.0
     edge_width_m: float = 60.0
 
@@ -511,42 +546,23 @@ class SerpentinizedZone(Anomaly):
         return self.soft_mask(X, Y, Z) > 0.5
 
     def soft_mask(self, X, Y, Z) -> np.ndarray:
-        _, m, _ = self._compute_full(vp_bg=None, X=X, Y=Y, Z=Z, only_mask=True)
-        return m
+        state = self._compute_state(X=X, Y=Y, Z=Z, vp_bg=None, need_internal=False)
+        return state["m_core"]
 
     def apply_to_vp(self, vp: np.ndarray, X, Y, Z) -> np.ndarray:
-        vp_new, _, _ = self._compute_full(vp_bg=vp, X=X, Y=Y, Z=Z, only_mask=False)
-        return vp_new
+        return self.apply_properties({"vp": vp}, X, Y, Z)["vp"]
 
     def apply_properties(self, props_dict: dict, X, Y, Z) -> dict:
         """
         Unified property interface applying serpentinization effects on vp, rho, chi, and resist.
         """
+        state = self._compute_state(X=X, Y=Y, Z=Z, vp_bg=props_dict.get("vp"), need_internal=True)
         out_props = {}
-        
-        # Determine masks
-        res = self._compute_full(vp_bg=props_dict.get('vp'), X=X, Y=Y, Z=Z, only_mask=(not 'vp' in props_dict), need_halo=True)
-        if len(res) == 4:
-            vp_new, m_core, m_halo, alt_degree = res
-        else:
-            vp_new, m_core, m_halo = res
-            alt_degree = m_core
-
-        p = self.params
-        
         for k, v in props_dict.items():
-            if k == 'vp':
-                out_props[k] = vp_new if vp_new is not None else v * (1.0 + float(p.vp_delta_frac) * alt_degree)
-            elif k == 'rho':
-                out_props[k] = v * (1.0 + float(getattr(p, 'rho_delta_frac', -0.12)) * alt_degree)
-            elif k == 'chi':
-                out_props[k] = v + float(getattr(p, 'chi_add_SI', 0.02)) * alt_degree
-            elif k == 'resist':
-                # Optional: resistivity typically decreases in serpentinized rocks
-                out_props[k] = v * (1.0 + float(getattr(p, 'resist_delta_frac', -0.3)) * alt_degree)
+            if k in {"vp", "rho", "chi", "resist"}:
+                out_props[k] = self._blend_property(k, np.asarray(v, dtype=np.float32), state)
             else:
                 out_props[k] = v.copy()
-                
         return out_props
 
     def build_property_models(
@@ -575,110 +591,284 @@ class SerpentinizedZone(Anomaly):
         else:
             chi_bg = chi_bg_SI.astype(np.float32, copy=False)
 
-        # Get core mask + halo mask + alteration degree
-        # Note: _compute_full returns (vp, m_core, m_halo, alteration_degree) now
-        res = self._compute_full(vp_bg=vp_bg, X=X, Y=Y, Z=Z, only_mask=True, need_halo=True)
-        # Handle unpacking if previous signature used 3
-        if len(res) == 4:
-            _, m_core, m_halo, alt_degree = res
-        else:
-            _, m_core, m_halo = res
-            alt_degree = m_core # Fallback
-
-        # Apply physics based on continuous alteration degree
-        # coherent and natural decay:
-        rho = rho_bg * (1.0 + float(p.rho_delta_frac) * alt_degree)
-        chi = chi_bg + float(p.chi_add_SI) * alt_degree
-
-        sub = np.zeros((nx, ny, nz), dtype=np.int32)
-        if m_halo is not None:
-             sub[m_halo > 0.5] = int(p.subtype_halo)
-        sub[m_core > 0.5] = int(p.subtype_core)
+        state = self._compute_state(X=X, Y=Y, Z=Z, vp_bg=vp_bg, need_internal=True)
+        rho = self._blend_property("rho", rho_bg, state)
+        chi = self._blend_property("chi", chi_bg, state)
+        sub = self._build_subtype_volume(state)
 
         out = {
             "rho": rho.astype(np.float32),
             "rho_gcc": rho.astype(np.float32),
             "chi_SI": chi.astype(np.float32),
             "subtype": sub,
-            "mask_core": m_core.astype(np.float32),
-            "mask_halo": m_halo.astype(np.float32) if m_halo is not None else np.zeros_like(m_core),
+            "mask_core": state["m_core"].astype(np.float32),
+            "mask_halo": state["m_halo"].astype(np.float32),
         }
         if vp_bg is not None:
-            # Re-apply Vp logic using alt_degree consistent with Rho/Chi
-            vp_mod = vp_bg.astype(np.float32, copy=False) * (1.0 + float(p.vp_delta_frac) * alt_degree)
-            out["vp_mps"] = vp_mod.astype(np.float32)
+            out["vp_mps"] = self._blend_property("vp", vp_bg.astype(np.float32, copy=False), state).astype(np.float32)
         return out
 
     # ---- internal ----
-    def _compute_full(self, vp_bg: np.ndarray, X, Y, Z, only_mask: bool = False, need_halo: bool = False):
+    def _compute_state(self, X, Y, Z, vp_bg: Optional[np.ndarray] = None, need_internal: bool = True):
         p = self.params
         rng = self._rng
         nx, ny, nz = Z.shape
 
-        # Regular grid assumption: X[:,0,0], Y[0,:,0], Z[0,0,:]
         x_arr = X[:, 0, 0].astype(np.float32, copy=False)
         y_arr = Y[0, :, 0].astype(np.float32, copy=False)
         z_arr = Z[0, 0, :].astype(np.float32, copy=False)
         X2d = x_arr[:, None]
         Y2d = y_arr[None, :]
 
-        # Precompute once
         if not self._pre:
             self._pre = self._precompute(p, X2d, Y2d, z_arr, rng, vp_bg=vp_bg, x_arr=x_arr, y_arr=y_arr)
 
         wd = max(float(p.edge_width_m), 1e-3)
         halo_t = max(float(p.halo_thickness_m), 1e-3)
 
-        vp_new = None if (only_mask or vp_bg is None) else np.empty_like(vp_bg, dtype=np.float32)
         m_core_vol = np.empty((nx, ny, nz), dtype=np.float32)
-        m_halo_vol = np.zeros((nx, ny, nz), dtype=np.float32) if need_halo else None
-        alt_degree_vol = np.empty((nx, ny, nz), dtype=np.float32)
+        m_halo_vol = np.zeros((nx, ny, nz), dtype=np.float32)
+        halo_weight_vol = np.zeros((nx, ny, nz), dtype=np.float32)
+
+        if need_internal:
+            matrix_weight_vol = np.zeros((nx, ny, nz), dtype=np.float32)
+            block_weight_vol = np.zeros((nx, ny, nz), dtype=np.float32)
+            vein_weight_vol = np.zeros((nx, ny, nz), dtype=np.float32)
+            foliation_vol = np.zeros((nx, ny, nz), dtype=np.float32)
+        else:
+            matrix_weight_vol = None
+            block_weight_vol = None
+            vein_weight_vol = None
+            foliation_vol = None
 
         for iz in range(nz):
             z_m = float(z_arr[iz])
             sdf_core = self._sdf_core_slice(p, X2d, Y2d, z_m, iz, self._pre)
             sdf_core = np.clip(sdf_core, -1e6, 1e6)
-            
-            # 1. Binary-like masks for labeling
+
             m_core = _sigmoid_stable(sdf_core / wd)
             m_core_vol[..., iz] = m_core
 
-            if need_halo:
-                # halo ring outside core: 0 < distance < t
-                m_out = _sigmoid_stable(-sdf_core / wd)         # outside selector
-                m_near = _sigmoid_stable((sdf_core + halo_t) / wd)   # within t selector
-                m_halo = m_out * m_near
-                m_halo_vol[..., iz] = m_halo
+            m_out = _sigmoid_stable(-sdf_core / wd)
+            m_near = _sigmoid_stable((sdf_core + halo_t) / wd)
+            m_halo = m_out * m_near
+            m_halo_vol[..., iz] = m_halo
 
-            # 2. Continuous Alteration Degree (Physics)
-            # Core (sdf>0) -> 1.0
-            # Halo (-halo_t < sdf < 0) -> Smooth decay 1.0->0.0
-            # Normalized coordinate u: 0 at outer edge (-t), 1 at core boundary (0)
-            u = (sdf_core + halo_t) / halo_t
-            u = np.clip(u, 0.0, 1.0)
-            # Smoothstep curve: 3u^2 - 2u^3
-            decay = u * u * (3.0 - 2.0 * u)
-            
-            # Combine: Inside core (u blocked at 1) + Halo decay
-            # sdf_core > 0 will have u=1 (clamped), so decay=1.
-            # But we want to soften the core edge slightly too?
-            # Actually decay=1 is fine for core. But 'u' approach implies hard clamping at 0 and 1.
-            # _sigmoid_stable handles the 'softness' at boundaries implicitly if we use sdf.
-            # But decay based on macro 'u' is better for the long tail.
-            
-            alt_degree = decay
-            alt_degree_vol[..., iz] = alt_degree
+            u = np.clip((sdf_core + halo_t) / halo_t, 0.0, 1.0)
+            halo_decay = (u * u * (3.0 - 2.0 * u)) * (1.0 - m_core)
+            halo_weight_vol[..., iz] = halo_decay.astype(np.float32)
 
-            if vp_new is not None:
-                vp_slice = vp_bg[..., iz].astype(np.float32, copy=False)
-                # Apply alteration
-                vp_slice = vp_slice * (1.0 + float(p.vp_delta_frac) * alt_degree)
-                vp_new[..., iz] = vp_slice
+            if need_internal:
+                matrix_w, block_w, vein_w, foliation = self._internal_components_slice(
+                    X2d, Y2d, z_m, iz, m_core, self._pre, p
+                )
+                matrix_weight_vol[..., iz] = matrix_w
+                block_weight_vol[..., iz] = block_w
+                vein_weight_vol[..., iz] = vein_w
+                foliation_vol[..., iz] = foliation
 
-        if need_halo:
-            return vp_new, m_core_vol, m_halo_vol, alt_degree_vol
-        
-        return vp_new, m_core_vol, None
+        state = {
+            "m_core": m_core_vol,
+            "m_halo": m_halo_vol,
+            "halo_weight": halo_weight_vol,
+        }
+        if need_internal:
+            state.update(
+                {
+                    "matrix_w": matrix_weight_vol,
+                    "block_w": block_weight_vol,
+                    "vein_w": vein_weight_vol,
+                    "foliation": foliation_vol,
+                }
+            )
+        return state
+
+    def _blend_property(self, key: str, base: np.ndarray, state: Dict[str, np.ndarray]) -> np.ndarray:
+        p = self.params
+        bg = np.asarray(base, dtype=np.float32)
+        m_core = state["m_core"]
+        halo_w = state["halo_weight"]
+        matrix_w = state.get("matrix_w")
+        block_w = state.get("block_w")
+        vein_w = state.get("vein_w")
+        foliation = state.get("foliation")
+
+        if matrix_w is None or block_w is None or vein_w is None:
+            matrix_w = m_core
+            block_w = np.zeros_like(m_core, dtype=np.float32)
+            vein_w = np.zeros_like(m_core, dtype=np.float32)
+            foliation = np.full_like(m_core, 0.5, dtype=np.float32)
+
+        matrix_degree = float(p.matrix_serp_degree) * (
+            1.0 + float(p.foliation_contrast_frac) * (2.0 * np.asarray(foliation, dtype=np.float32) - 1.0)
+        )
+        block_degree = np.full_like(matrix_degree, float(p.block_serp_degree), dtype=np.float32)
+        vein_degree = np.full_like(matrix_degree, float(p.vein_serp_degree), dtype=np.float32)
+
+        background_w = np.clip(1.0 - m_core - halo_w, 0.0, 1.0)
+
+        if key == "chi":
+            delta = float(p.chi_add_SI)
+            halo_prop = bg + delta * halo_w
+            matrix_prop = bg + delta * matrix_degree
+            block_prop = bg + delta * block_degree
+            vein_prop = bg + delta * vein_degree
+        else:
+            if key == "vp":
+                delta = float(p.vp_delta_frac)
+            elif key == "rho":
+                delta = float(p.rho_delta_frac)
+            elif key == "resist":
+                delta = float(p.resist_delta_frac)
+            else:
+                return bg.copy()
+
+            halo_prop = bg * (1.0 + delta * halo_w)
+            matrix_prop = bg * (1.0 + delta * matrix_degree)
+            block_prop = bg * (1.0 + delta * block_degree)
+            vein_prop = bg * (1.0 + delta * vein_degree)
+
+        out = (
+            bg * background_w
+            + halo_prop * halo_w
+            + matrix_prop * matrix_w
+            + block_prop * block_w
+            + vein_prop * vein_w
+        )
+        return out.astype(np.float32, copy=False)
+
+    def _build_subtype_volume(self, state: Dict[str, np.ndarray]) -> np.ndarray:
+        p = self.params
+        sub = np.zeros_like(state["m_core"], dtype=np.int32)
+        sub[state["m_halo"] > 0.5] = int(p.subtype_halo)
+
+        core_active = state["m_core"] > 0.5
+        matrix_w = state["matrix_w"]
+        block_w = state["block_w"]
+        vein_w = state["vein_w"]
+        m_core = np.maximum(state["m_core"], 1e-6)
+
+        matrix_pick = core_active
+        block_pick = core_active & (block_w >= 0.28 * m_core)
+        vein_pick = core_active & (vein_w >= 0.12 * m_core) & (~block_pick)
+
+        sub[matrix_pick] = int(p.subtype_matrix)
+        sub[block_pick] = int(p.subtype_blocks)
+        sub[vein_pick] = int(p.subtype_veins)
+        return sub
+
+    def _internal_components_slice(self, X2d, Y2d, z_m: float, iz: int, m_core: np.ndarray, pre, p):
+        block_frac = self._block_fraction_slice(X2d, Y2d, z_m, pre, p)
+        block_frac = np.clip(block_frac, 0.0, 0.92)
+
+        theta_eff = np.asarray(pre["theta_xy"], dtype=np.float32).copy()
+        wrap_strength = math.radians(float(p.block_wrap_strength_deg))
+        for block in pre.get("resolved_blocks", []):
+            dz_rel = (z_m - float(block["cz"])) / max(float(block["rz"]), 1e-3)
+            if abs(dz_rel) > 1.4:
+                continue
+            dx = (X2d - float(block["cx"])).astype(np.float32)
+            dy = (Y2d - float(block["cy"])).astype(np.float32)
+            r2 = dx * dx + dy * dy
+            influence_scale = max(float(block["rx"]), float(block["ry"])) * 2.4
+            influence = np.exp(-r2 / max(influence_scale * influence_scale, 1e-3)).astype(np.float32)
+            influence *= float(np.exp(-0.7 * dz_rel * dz_rel))
+            theta_target = np.arctan2(dy, dx).astype(np.float32) + 0.5 * np.pi
+            theta_eff += wrap_strength * influence * _wrapped_angle_delta(theta_target, theta_eff)
+
+        s_coord = np.cos(theta_eff) * X2d + np.sin(theta_eff) * Y2d
+        t_coord = -np.sin(theta_eff) * X2d + np.cos(theta_eff) * Y2d
+
+        fol_spacing = max(float(p.foliation_spacing_m), 1e-3)
+        foliation = 0.5 + 0.5 * np.sin(
+            2.0 * np.pi * (t_coord / fol_spacing + 0.18 * np.sin((s_coord + 0.4 * z_m) / max(1.8 * fol_spacing, 1e-3)))
+        )
+        foliation = np.clip(foliation.astype(np.float32), 0.0, 1.0)
+
+        vein_density = self._vein_density_slice(X2d, Y2d, z_m, s_coord, t_coord, theta_eff, pre, p)
+        matrix_available = np.clip(1.0 - block_frac, 0.0, 1.0)
+        vein_weight = m_core * matrix_available * np.clip(float(p.vein_intensity_frac) * vein_density, 0.0, 0.85)
+        block_weight = m_core * block_frac
+        matrix_weight = np.clip(m_core - block_weight - vein_weight, 0.0, 1.0)
+        return (
+            matrix_weight.astype(np.float32),
+            block_weight.astype(np.float32),
+            vein_weight.astype(np.float32),
+            foliation.astype(np.float32),
+        )
+
+    def _block_fraction_slice(self, X2d, Y2d, z_m: float, pre, p):
+        plane_shape = (X2d.shape[0], Y2d.shape[1])
+        block_resolved = np.zeros(plane_shape, dtype=np.float32)
+        for block in pre.get("resolved_blocks", []):
+            dx = (X2d - float(block["cx"])).astype(np.float32)
+            dy = (Y2d - float(block["cy"])).astype(np.float32)
+            dz = np.float32(z_m - float(block["cz"]))
+            ca = float(block["cos"])
+            sa = float(block["sin"])
+            xr = ca * dx + sa * dy
+            yr = -sa * dx + ca * dy
+            rr = (
+                (xr / max(float(block["rx"]), 1e-3)) ** 2
+                + (yr / max(float(block["ry"]), 1e-3)) ** 2
+                + (dz / max(float(block["rz"]), 1e-3)) ** 2
+            )
+            field = np.clip(1.0 - rr, 0.0, 1.0).astype(np.float32)
+            block_resolved = np.maximum(block_resolved, field)
+
+        spectral = np.zeros(plane_shape, dtype=np.float32)
+        amp_sum = 1e-6
+        for mode in pre.get("block_modes", []):
+            arg = (
+                float(mode["kx"]) * X2d
+                + float(mode["ky"]) * Y2d
+                + float(mode["kz"]) * z_m
+                + float(mode["phase"])
+            )
+            spectral += float(mode["amp"]) * np.cos(arg).astype(np.float32)
+            amp_sum += abs(float(mode["amp"]))
+        spectral = 0.5 + 0.5 * spectral / amp_sum
+        block_noise = _sigmoid_stable((spectral - float(pre.get("block_threshold", 0.62))) / 0.08)
+
+        block_frac = np.maximum(block_resolved, 0.75 * block_noise)
+        return np.clip(block_frac, 0.0, 1.0).astype(np.float32)
+
+    def _vein_density_slice(self, X2d, Y2d, z_m: float, s_coord, t_coord, theta_eff, pre, p):
+        dx_m = float(pre.get("dx_m", 1.0))
+        dy_m = float(pre.get("dy_m", 1.0))
+        min_vis_width = 0.15 * min(dx_m, dy_m)
+        width_eff = max(float(np.random.default_rng(int(p.rng_seed) + int(z_m // max(pre.get("dz_m", 1.0), 1.0))).uniform(
+            p.vein_width_min_m, p.vein_width_max_m
+        )), min_vis_width)
+
+        spacing1 = max(float(p.vein_spacing_m), 1e-3)
+        spacing2 = max(spacing1 * 0.78, 1e-3)
+        spacing3 = max(spacing1 * 1.18, 1e-3)
+        irr = float(p.vein_irregularity_frac)
+        warp1 = irr * 0.35 * spacing1 * np.sin((0.85 * X2d + 1.15 * Y2d + 0.3 * z_m) / max(0.9 * spacing1, 1e-3))
+        warp2 = irr * 0.28 * spacing2 * np.cos((1.10 * X2d - 0.70 * Y2d + 0.45 * z_m) / max(1.1 * spacing2, 1e-3))
+        oblique = 0.7 * s_coord + 1.1 * t_coord + 0.2 * np.sin(theta_eff) * spacing3
+
+        d1 = _periodic_line_distance(s_coord + warp1, spacing1)
+        d2 = _periodic_line_distance(t_coord + warp2, spacing2)
+        d3 = _periodic_line_distance(oblique, spacing3)
+        soft = max(width_eff * 0.35, 0.25)
+        vein1 = _sigmoid_stable((width_eff - d1) / soft)
+        vein2 = _sigmoid_stable((width_eff - d2) / soft)
+        vein3 = _sigmoid_stable((0.75 * width_eff - d3) / max(0.75 * soft, 0.2))
+        vein_density = np.maximum.reduce([vein1, vein2, vein3])
+        return np.clip(vein_density.astype(np.float32), 0.0, 1.0)
+
+    @staticmethod
+    def _polyline_tangent_angle_map(X2d, Y2d, xs, ys):
+        dx = X2d[..., None] - xs[None, None, :]
+        dy = Y2d[..., None] - ys[None, None, :]
+        d2 = dx * dx + dy * dy
+        idx = np.argmin(d2, axis=2)
+        tx = np.gradient(xs.astype(np.float32))
+        ty = np.gradient(ys.astype(np.float32))
+        theta = np.arctan2(ty, tx).astype(np.float32)
+        return theta[idx].astype(np.float32)
 
     def _precompute(self, p, X2d, Y2d, z_arr, rng, vp_bg=None, x_arr=None, y_arr=None):
         # Decide anchor layer if requested and available
@@ -756,6 +946,7 @@ class SerpentinizedZone(Anomaly):
 
         pre["xs"] = xs
         pre["ys"] = ys
+        pre["theta_xy"] = self._polyline_tangent_angle_map(X2d, Y2d, xs, ys)
 
         # 2) Depth function zc(x,y)
         nx, ny = X2d.shape[0], Y2d.shape[1]
@@ -832,6 +1023,65 @@ class SerpentinizedZone(Anomaly):
                 sdf_xy = np.maximum(sdf_xy, sdf_e)
 
         pre["sdf_xy"] = sdf_xy
+
+        dx_m = float(x_arr[1] - x_arr[0]) if (x_arr is not None and x_arr.size > 1) else 1.0
+        dy_m = float(y_arr[1] - y_arr[0]) if (y_arr is not None and y_arr.size > 1) else 1.0
+        dz_m = float(z_arr[1] - z_arr[0]) if z_arr.size > 1 else 1.0
+        pre["dx_m"] = dx_m
+        pre["dy_m"] = dy_m
+        pre["dz_m"] = dz_m
+
+        block_modes = []
+        n_modes = max(3, int(p.block_noise_modes))
+        lam_min = max(1.5 * min(dx_m, dy_m), float(p.block_diameter_min_m) * 1.25)
+        lam_max = max(lam_min + 1.0, float(p.block_diameter_max_m) * 2.8)
+        for _ in range(n_modes):
+            lam_xy = rng.uniform(lam_min, lam_max)
+            az = rng.uniform(0.0, 2.0 * np.pi)
+            kx = (2.0 * np.pi / max(lam_xy, 1e-6)) * np.cos(az)
+            ky = (2.0 * np.pi / max(lam_xy, 1e-6)) * np.sin(az)
+            lam_z = rng.uniform(max(1.2 * dz_m, 18.0), max(float(p.block_diameter_max_m) * 2.4, 30.0))
+            kz = rng.choice([-1.0, 1.0]) * (2.0 * np.pi / max(lam_z, 1e-6))
+            block_modes.append(
+                {
+                    "amp": float(rng.uniform(0.7, 1.2)),
+                    "kx": float(kx),
+                    "ky": float(ky),
+                    "kz": float(kz),
+                    "phase": float(rng.uniform(0.0, 2.0 * np.pi)),
+                }
+            )
+        pre["block_modes"] = block_modes
+        pre["block_threshold"] = float(np.clip(0.58 + 0.20 * float(p.matrix_volume_frac), 0.55, 0.78))
+
+        resolved_blocks = []
+        block_count = max(8, int(p.resolved_block_count))
+        for _ in range(block_count):
+            j = int(rng.integers(0, len(xs)))
+            cx = float(xs[j] + rng.normal(0.0, 0.35 * max(float(p.corridor_halfwidth_m), dx_m)))
+            cy = float(ys[j] + rng.normal(0.0, 0.35 * max(float(p.corridor_halfwidth_m), dy_m)))
+            ix = int(np.clip(round((cx - float(X2d[0, 0])) / max(dx_m, 1e-6)), 0, X2d.shape[0] - 1))
+            iy = int(np.clip(round((cy - float(Y2d[0, 0])) / max(dy_m, 1e-6)), 0, Y2d.shape[1] - 1))
+            cz_local = float(pre["zc"][ix, iy]) + rng.normal(0.0, 0.18 * float(p.thickness_m))
+            diam = float(rng.uniform(p.block_diameter_min_m, p.block_diameter_max_m))
+            rx = max(0.5 * diam * rng.uniform(0.7, 1.25), 0.45 * dx_m)
+            ry = max(0.5 * diam * rng.uniform(0.7, 1.55), 0.45 * dy_m)
+            rz = max(0.35 * diam * rng.uniform(0.6, 1.10), 0.35 * dz_m)
+            az = float(pre["theta_xy"][ix, iy] + rng.normal(0.0, 0.45))
+            resolved_blocks.append(
+                {
+                    "cx": cx,
+                    "cy": cy,
+                    "cz": float(np.clip(cz_local, float(z_arr[0]), float(z_arr[-1]))),
+                    "rx": float(rx),
+                    "ry": float(ry),
+                    "rz": float(rz),
+                    "az": az,
+                    "cos": float(np.cos(az)),
+                    "sin": float(np.sin(az)),
+                }
+            )
+        pre["resolved_blocks"] = resolved_blocks
 
         # 4) Patchiness seeds (optional)
         if p.mode == "patchy":

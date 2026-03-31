@@ -227,6 +227,17 @@ class IgneousIntrusionParams:
     swarm_count: int = 8
     swarm_spacing_m: float = 200.0
     swarm_fan_deg: float = 10.0  # 0 means parallel
+    swarm_spacing_jitter_frac: float = 0.15
+    swarm_parallel_jitter_deg: float = 1.5
+    swarm_dip_jitter_deg: float = 1.0
+    swarm_thickness_min_m: float = 3.0
+    swarm_thickness_max_m: float = 8.0
+    swarm_length_min_m: float = 1000.0
+    swarm_length_max_m: float = 10000.0
+    swarm_echelon_zone_frac: float = 0.45
+    swarm_echelon_step_m: float = 120.0
+    swarm_top_z_m: float = 0.0
+    swarm_base_z_m: float = 3500.0
 
     # ---- STOCK / PLUG ----
     stock_xc_m: float = 0.0
@@ -549,22 +560,47 @@ class IgneousIntrusion(Anomaly):
         if p.kind == "dyke":
             dykes = [base]
         else:
-            # swarm
+            # Swarm: mostly parallel, steeply dipping narrow dykes with
+            # optional local en echelon stepping along strike.
             n = int(p.swarm_count)
             spacing = float(p.swarm_spacing_m)
             fan = float(p.swarm_fan_deg)
             strike0 = base["strike"]
             ang = math.radians(strike0)
             u_perp = np.array([-math.sin(ang), math.cos(ang), 0.0], dtype=np.float32)
+            u_strike = np.array([math.cos(ang), math.sin(ang), 0.0], dtype=np.float32)
+            u_strike = _unit(u_strike)
             
             idxs = np.arange(n, dtype=np.float32) - (n - 1) / 2.0
-            for j, jj in enumerate(idxs):
+            echelon_limit = max(0.0, 0.5 * max(n - 1, 1) * float(p.swarm_echelon_zone_frac))
+            th_min = max(0.25, float(p.swarm_thickness_min_m))
+            th_max = max(th_min, float(p.swarm_thickness_max_m))
+            len_min = max(50.0, float(p.swarm_length_min_m))
+            len_max = max(len_min, float(p.swarm_length_max_m))
+            z_top = float(p.swarm_top_z_m)
+            z_base = max(z_top + 50.0, float(p.swarm_base_z_m))
+            dip_jitter = abs(float(p.swarm_dip_jitter_deg))
+            strike_jitter = abs(float(p.swarm_parallel_jitter_deg))
+            spacing_jitter = abs(float(p.swarm_spacing_jitter_frac))
+
+            for jj in idxs:
                 dyke = dict(base)
-                if fan > 0:
-                    dyke["strike"] = float(strike0 + (jj / max((n - 1) / 2.0, 1.0)) * (fan / 2.0))
-                dx, dy = (jj * spacing) * u_perp[0], (jj * spacing) * u_perp[1]
-                dyke["x0"] = float(base["x0"] + dx)
-                dyke["y0"] = float(base["y0"] + dy)
+                fan_term = 0.0
+                if fan > 0.0:
+                    fan_term = (jj / max((n - 1) / 2.0, 1.0)) * (fan / 2.0)
+                dyke["strike"] = float(strike0 + fan_term + rng.normal(0.0, strike_jitter))
+                dyke["dip"] = float(np.clip(base["dip"] + rng.normal(0.0, dip_jitter), 82.0, 89.5))
+                dyke["th"] = float(rng.uniform(th_min, th_max))
+                dyke["len"] = float(rng.uniform(len_min, len_max))
+                lateral_spacing = float(spacing * (1.0 + rng.normal(0.0, spacing_jitter)))
+                dx, dy = (jj * lateral_spacing) * u_perp[0], (jj * lateral_spacing) * u_perp[1]
+                echelon_shift = 0.0
+                if abs(float(jj)) <= echelon_limit and abs(float(p.swarm_echelon_step_m)) > 1e-6:
+                    echelon_shift = float(jj) * float(p.swarm_echelon_step_m)
+                dyke["x0"] = float(base["x0"] + dx + echelon_shift * u_strike[0])
+                dyke["y0"] = float(base["y0"] + dy + echelon_shift * u_strike[1])
+                dyke["z_top"] = z_top
+                dyke["z_base"] = z_base
                 dykes.append(dyke)
                 
         frames = []
@@ -581,6 +617,16 @@ class IgneousIntrusion(Anomaly):
              n = _unit(n)
              v = np.cross(n, u)
              v = _unit(v)
+             if "z_top" in d and "z_base" in d:
+                 z_top = float(d["z_top"])
+                 z_base = float(d["z_base"])
+                 dz_span = max(z_base - z_top, 50.0)
+                 v_z = abs(float(v[2]))
+                 if v_z > 1e-3:
+                     d["wid"] = max(float(d["wid"]), dz_span / v_z)
+                 else:
+                     d["wid"] = max(float(d["wid"]), dz_span)
+                 d["z0"] = 0.5 * (z_top + z_base)
              frames.append({"u": u, "v": v, "n": n})
              
         return {"dykes": dykes, "frames": frames}

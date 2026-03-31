@@ -13,6 +13,8 @@ SUBTYPE_COLORS = {
     31: "green",
     40: "blue",
     41: "teal",
+    42: "gold",
+    43: "white",
 }
 
 
@@ -36,7 +38,7 @@ def extract_subtype_labels(anomaly, X, Y, Z, fallback_mask, vp_bg=None):
                     viz_sub[facies_sbi == 2] = 30
                     viz_sub[facies_sbi == 3] = 31
                     return viz_sub
-            if getattr(anomaly, "type", "") == "serpentinized_zone":
+            if getattr(anomaly, "type", "") in {"serpentinized_zone", "serpentinized"}:
                 serp_sub = multiprops.get("subtype")
                 if serp_sub is not None:
                     return serp_sub

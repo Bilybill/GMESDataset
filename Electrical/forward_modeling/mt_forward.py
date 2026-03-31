@@ -45,6 +45,14 @@ def _generate_phoenix_frequencies(f_min: float, f_max: float) -> list[float]:
     return freqs
 
 
+def generate_mt_frequencies(f_min: float, f_max: float) -> list[float]:
+    """
+    Public helper for building the Phoenix-style MT frequency list used by
+    the project from a requested frequency range.
+    """
+    return _generate_phoenix_frequencies(float(f_min), float(f_max))
+
+
 def resolve_auto_mt_frequencies(rho_tensor: torch.Tensor, dz: float):
     bg_rho = _estimate_boundary_background_rho(rho_tensor)
     skin_depth_min = dz * 2.0

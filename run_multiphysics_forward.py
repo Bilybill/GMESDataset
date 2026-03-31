@@ -13,6 +13,7 @@ from core.forward_modeling.gravity import GravityForwardSolver
 from core.forward_modeling.magnetic import MagneticForwardSolver
 from core.forward_modeling.electrical import ElectricalForwardSolver
 from core.forward_modeling.seismic import SeismicForwardSolver
+from Electrical.forward_modeling.mt_forward import generate_mt_frequencies
 
 
 DENSITY_UNIT = "g/cm^3"
@@ -192,6 +193,25 @@ def _build_seismic_3d_config(shape, spacing, preset="full"):
         },
     }
 
+
+def _resolve_seismic_batch_size(requested_batch_size, n_shots):
+    batch_size = int(requested_batch_size)
+    if batch_size <= 0:
+        return int(n_shots)
+    return min(batch_size, int(n_shots))
+
+
+def _resolve_mt_frequency_list(mt_freq_min, mt_freq_max):
+    if mt_freq_min is None and mt_freq_max is None:
+        return None
+    if mt_freq_min is None or mt_freq_max is None:
+        raise ValueError("Please provide both mt_freq_min and mt_freq_max, or leave both unset for auto MT frequencies.")
+    mt_freq_min = float(mt_freq_min)
+    mt_freq_max = float(mt_freq_max)
+    if mt_freq_min <= 0.0 or mt_freq_max <= 0.0:
+        raise ValueError("MT frequency bounds must be positive.")
+    return generate_mt_frequencies(mt_freq_min, mt_freq_max)
+
 def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
     """读取 SEGY 构建指定异常体的四参数模型，用于四法联合正演基准。"""
     try:
@@ -225,7 +245,7 @@ def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
         "anomaly_name_zh": preset.name_zh,
     }
 
-def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full"):
+def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None):
     print("====== 1. 模型生成 ======")
     gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
     model = generate_model(vp_segy_path, label_segy_path, anomaly_type=anomaly_type)
@@ -264,6 +284,7 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         "magnetic_status": np.array("not_run"),
         "seismic_status": np.array("not_run"),
         "seismic_preset": np.array(str(seismic_preset)),
+        "seismic_batch_size": np.array(int(seismic_batch_size), dtype=np.int32),
     }
     
     # 主模型常驻 CPU，分模块按需搬运，避免某个 CUDA 扩展失败后影响后续模块。
@@ -307,20 +328,20 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
             log_scale=False,
         )
 
-        # # 将降采样后的三维电阻率模型保存为 bin 文件，供独立 MTForward3D 项目测试和定位不收敛问题
-        # bin_save_path = os.path.join(save_dir, f"downsampled_mt_model_{target_shape[0]}x{target_shape[1]}x{target_shape[2]}.bin")
-        # # 许多 C++ 反演/正演代码期望的内存顺序为 X 变化最快 (NX内循环)，即在 Python 中看起来像 (NZ, NY, NX)
-        # res_down.permute(2, 1, 0).contiguous().cpu().numpy().astype(np.float32).tofile(bin_save_path)
-        # print(f"[+] Saved downsampled MT model (bin) to: {bin_save_path}")
-        # raise ValueError("MT Forward not implemented yet. This is a placeholder to ensure the pipeline runs up to MT forward. Please implement MT forward or comment out this raise statement to proceed with the rest of the pipeline.")
+        mt_freqs = _resolve_mt_frequency_list(mt_freq_min, mt_freq_max)
+        if mt_freqs is None:
+            print("MT frequency mode: auto")
+        else:
+            print(
+                f"MT frequency mode: user range {float(mt_freq_min):g} Hz - {float(mt_freq_max):g} Hz "
+                f"({len(mt_freqs)} Phoenix frequencies)"
+            )
+            print(f"  --> MT frequencies: {mt_freqs}")
 
-        mt_solver = ElectricalForwardSolver(None, mt_dx, mt_dy, mt_dz)
-        if mt_solver.last_freqs is not None:
-            print(f"MT auto-selected {len(mt_solver.last_freqs)} frequencies: {list(mt_solver.last_freqs)}")
+        mt_solver = ElectricalForwardSolver(mt_freqs, mt_dx, mt_dy, mt_dz)
         t0 = time.time()
         print(f'res down device type: {res_down.device}, dtype: {res_down.dtype}, shape = {res_down.shape}')
         try:
-            # with torch.no_grad():
             app_res, phase = mt_solver(res_down.to(torch.float64))
             print(f"MT completed in {time.time()-t0:.2f}s. AppRes shape: {app_res.shape}, device: {app_res.device}")
             bundle["mt_status"] = np.array("ok")
@@ -332,6 +353,9 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
             bundle["mt_dz"] = np.array(mt_dz, dtype=np.float32)
             if mt_solver.last_freqs is not None:
                 bundle["mt_freqs_hz"] = np.asarray(mt_solver.last_freqs, dtype=np.float32)
+            if mt_freq_min is not None and mt_freq_max is not None:
+                bundle["mt_freq_min_hz"] = np.array(float(mt_freq_min), dtype=np.float32)
+                bundle["mt_freq_max_hz"] = np.array(float(mt_freq_max), dtype=np.float32)
         except Exception as e:
             print(f"MT Forward failed (ensure mt_forward_cuda installed): {e}")
             bundle["mt_status"] = np.array("failed")
@@ -432,13 +456,14 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         n_shots = int(source_locations.shape[0])
         n_src = int(source_locations.shape[1])
         n_rec = int(receiver_locations.shape[1])
+        resolved_batch_size = _resolve_seismic_batch_size(seismic_batch_size, n_shots)
         print(
             f"  --> Seismic preset: {seismic_preset} | shots={n_shots} "
             f"({seismic_config['source']['n_shots_x']}x{seismic_config['source']['n_shots_y']}), "
             f"receivers/shot={n_rec} "
             f"({seismic_config['receiver']['n_receivers_x']}x{seismic_config['receiver']['n_receivers_y']})"
         )
-        src_amp_single = wavelet.view(1, 1, nt).repeat(1, n_src, 1)
+        print(f"  --> Seismic batch size: {resolved_batch_size} shot(s)/batch")
         bundle["seismic_source_locations"] = _tensor_to_numpy(source_locations).astype(np.int16, copy=False)
         bundle["seismic_receiver_locations"] = _tensor_to_numpy(receiver_locations).astype(np.int16, copy=False)
         bundle["seismic_wavelet"] = _tensor_to_numpy(wavelet).astype(np.float32, copy=False)
@@ -446,28 +471,34 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         bundle["seismic_nt"] = np.array(nt, dtype=np.int32)
         bundle["seismic_freq_hz"] = np.array(freq_hz, dtype=np.float32)
         bundle["seismic_mode"] = np.array("3D")
+        bundle["seismic_batch_size"] = np.array(resolved_batch_size, dtype=np.int32)
 
         t0 = time.time()
         try:
             shot_gathers = []
-            for shot_idx in range(n_shots):
-                if shot_idx == 0 or (shot_idx + 1) % 5 == 0 or shot_idx + 1 == n_shots:
-                    print(f"  --> Seismic shot {shot_idx + 1}/{n_shots}")
+            for batch_start in range(0, n_shots, resolved_batch_size):
+                batch_end = min(batch_start + resolved_batch_size, n_shots)
+                if resolved_batch_size == n_shots:
+                    print(f"  --> Seismic batch 1/1: shots {batch_start + 1}-{batch_end}")
+                else:
+                    batch_idx = batch_start // resolved_batch_size + 1
+                    n_batches = (n_shots + resolved_batch_size - 1) // resolved_batch_size
+                    print(f"  --> Seismic batch {batch_idx}/{n_batches}: shots {batch_start + 1}-{batch_end}")
+                src_amp_batch = wavelet.view(1, 1, nt).repeat(batch_end - batch_start, n_src, 1)
                 seis_solver = SeismicForwardSolver(
                     [dx, dy, dz],
                     dt,
-                    src_amp_single,
-                    source_locations[shot_idx:shot_idx + 1],
-                    receiver_locations[shot_idx:shot_idx + 1],
+                    src_amp_batch,
+                    source_locations[batch_start:batch_end],
+                    receiver_locations[batch_start:batch_end],
                     pml_freq=freq_hz,
                     accuracy=int(seismic_config["simulation"].get("accuracy", 4)),
                 ).to(seismic_device)
                 with torch.no_grad():
                     out = seis_solver(vp_3d)
                     shot_gathers.append(out[-1].detach().cpu())
-                if seismic_device.type == "cuda":
+                if seismic_device.type == "cuda" and batch_end < n_shots:
                     torch.cuda.empty_cache()
-
             seis_data = torch.cat(shot_gathers, dim=0)
             print(f"Seismic 3D completed in {time.time()-t0:.2f}s. Data shape: {seis_data.shape}")
             
@@ -485,6 +516,7 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
             print(f"Seismic Forward failed (ensure Deepwave installed): {e}")
             bundle["seismic_status"] = np.array("failed")
             bundle["seismic_error"] = np.array(str(e))
+            raise e  # Seismic failure is critical, re-raise to halt pipeline. Comment out this line if you want to proceed with saving the bundle even if seismic forward fails.
             
     bundle_path = os.path.join(save_dir, "forward_bundle.npz")
     np.savez(bundle_path, **bundle)
@@ -499,7 +531,10 @@ if __name__ == '__main__':
     parser.add_argument("--skip_seismic", action="store_true")
     parser.add_argument("--skip_mt", action="store_true")
     parser.add_argument("--anomaly-type", dest="anomaly_type", type=str, default="igneous_swarm", choices=FORWARD_ANOMALY_TYPES, help="Anomaly to inject for forward modeling.")
+    parser.add_argument("--mt-freq-min", dest="mt_freq_min", type=float, default=None, help="Minimum MT frequency in Hz. Must be used together with --mt-freq-max.")
+    parser.add_argument("--mt-freq-max", dest="mt_freq_max", type=float, default=None, help="Maximum MT frequency in Hz. Must be used together with --mt-freq-min.")
     parser.add_argument("--seismic-preset", dest="seismic_preset", type=str, default="full", choices=SEISMIC_PRESETS, help="3D seismic acquisition size preset.")
+    parser.add_argument("--seismic-batch-size", dest="seismic_batch_size", type=int, default=0, help="Number of shots per Deepwave batch. Use 0 to run all shots in one batch.")
     parser.add_argument("--anomaly_mode", dest="gravity_anomaly_mode", type=str, default="background", choices=["absolute", "background", "constant"], help="Forward mode for input density/susceptibility: absolute, background, or constant.")
     parser.add_argument("--bg_density", dest="gravity_bg_density", type=float, default=2.67, help="Constant bulk density in g/cm^3 to subtract for 'constant' mode.")
     parser.add_argument("--device", dest="torch_device_preference", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device for Torch-based modules (gravity/magnetic/seismic). MT keeps its own CUDA backend.")
@@ -517,4 +552,7 @@ if __name__ == '__main__':
         torch_device_preference=args.torch_device_preference,
         anomaly_type=args.anomaly_type,
         seismic_preset=args.seismic_preset,
+        seismic_batch_size=args.seismic_batch_size,
+        mt_freq_min=args.mt_freq_min,
+        mt_freq_max=args.mt_freq_max,
     )
