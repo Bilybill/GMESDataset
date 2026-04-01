@@ -5,7 +5,19 @@ class GravityForwardSolver(BaseForwardSolver):
     """
     Gravity Forward Modeling Solver (vertical component gz).
     """
-    def __init__(self, dx, dy, dz, heights_m, obs_conf, G=6.67430e-11, output_unit="mgal", pad_factor=2, density_unit="g/cm^3"):
+    def __init__(
+        self,
+        dx,
+        dy,
+        dz,
+        heights_m,
+        obs_conf,
+        G=6.67430e-11,
+        output_unit="mgal",
+        pad_factor=2,
+        density_unit="g/cm^3",
+        algorithm="prism_exact",
+    ):
         super().__init__()
         self.dx = dx
         self.dy = dy
@@ -16,6 +28,7 @@ class GravityForwardSolver(BaseForwardSolver):
         self.output_unit = output_unit
         self.pad_factor = pad_factor
         self.density_unit = density_unit
+        self.algorithm = algorithm
 
     def forward(self, density: torch.Tensor):
         """
@@ -34,6 +47,7 @@ class GravityForwardSolver(BaseForwardSolver):
             G=self.G,
             output_unit=self.output_unit,
             pad_factor=self.pad_factor,
-            density_unit=self.density_unit
+            density_unit=self.density_unit,
+            algorithm=self.algorithm,
         )
         return data, meta

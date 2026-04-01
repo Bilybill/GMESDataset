@@ -245,7 +245,7 @@ def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
         "anomaly_name_zh": preset.name_zh,
     }
 
-def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None):
+def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None):
     print("====== 1. 模型生成 ======")
     gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
     model = generate_model(vp_segy_path, label_segy_path, anomaly_type=anomaly_type)
@@ -281,6 +281,7 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         "anomaly_name_zh": np.array(model["anomaly_name_zh"]),
         "mt_status": np.array("not_run"),
         "gravity_status": np.array("not_run"),
+        "gravity_algorithm": np.array(str(gravity_algorithm)),
         "magnetic_status": np.array("not_run"),
         "seismic_status": np.array("not_run"),
         "seismic_preset": np.array(str(seismic_preset)),
@@ -383,12 +384,12 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
 
         obs_conf_grav = {'layout': 'grid', 'n_x': nx, 'n_y': ny, 'first_x': 0, 'first_y': 0, 'd_x': 1, 'd_y': 1}
         grav_solver = GravityForwardSolver(
-            dx, dy, dz, heights_m=[0.0], obs_conf=obs_conf_grav, output_unit="mgal", density_unit=DENSITY_UNIT
+            dx, dy, dz, heights_m=[0.0], obs_conf=obs_conf_grav, output_unit="mgal", density_unit=DENSITY_UNIT, algorithm=gravity_algorithm
         ).to(gravity_device)
         t0 = time.time()
         with torch.no_grad():
             grav_data, _ = grav_solver(gravity_input_density)
-        print(f"Gravity completed in {time.time()-t0:.2f}s, min: {grav_data.min():.2f} mGal, max: {grav_data.max():.2f} mGal")
+        print(f"Gravity completed in {time.time()-t0:.2f}s using '{gravity_algorithm}', min: {grav_data.min():.2f} mGal, max: {grav_data.max():.2f} mGal")
         
         grav_np = grav_data.cpu().numpy().squeeze()
         bundle["gravity_status"] = np.array("ok")
@@ -423,11 +424,14 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
             magnetic_input_chi = chi_tensor
 
         obs_conf_mag = {'layout': 'grid', 'n_x': nx, 'n_y': ny, 'first_x': 0, 'first_y': 0, 'd_x': 1, 'd_y': 1}
-        mag_solver = MagneticForwardSolver(dx, dy, dz, heights_m=[0.0], obs_conf=obs_conf_mag, inc=90.0, dec=0.0).to(magnetic_device)
+        magnetic_algorithm = "standard_B"
+        mag_solver = MagneticForwardSolver(
+            dx, dy, dz, heights_m=[0.0], obs_conf=obs_conf_mag, inc=90.0, dec=0.0, algorithm=magnetic_algorithm
+        ).to(magnetic_device)
         t0 = time.time()
         with torch.no_grad():
             mag_data, _ = mag_solver(magnetic_input_chi)
-        print(f"Magnetic completed in {time.time()-t0:.2f}s, min: {mag_data.min():.2f} nT, max: {mag_data.max():.2f} nT")
+        print(f"Magnetic completed in {time.time()-t0:.2f}s using '{magnetic_algorithm}', min: {mag_data.min():.2f} nT, max: {mag_data.max():.2f} nT")
         
         mag_np = mag_data.cpu().numpy().squeeze()
         bundle["magnetic_status"] = np.array("ok")
@@ -537,6 +541,7 @@ if __name__ == '__main__':
     parser.add_argument("--seismic-batch-size", dest="seismic_batch_size", type=int, default=0, help="Number of shots per Deepwave batch. Use 0 to run all shots in one batch.")
     parser.add_argument("--anomaly_mode", dest="gravity_anomaly_mode", type=str, default="background", choices=["absolute", "background", "constant"], help="Forward mode for input density/susceptibility: absolute, background, or constant.")
     parser.add_argument("--bg_density", dest="gravity_bg_density", type=float, default=2.67, help="Constant bulk density in g/cm^3 to subtract for 'constant' mode.")
+    parser.add_argument("--gravity-algorithm", dest="gravity_algorithm", type=str, default="prism_exact", choices=["point_mass_fast", "prism_exact"], help="Gravity forward kernel: fast point-mass approximation or exact rectangular-prism kernel.")
     parser.add_argument("--device", dest="torch_device_preference", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device for Torch-based modules (gravity/magnetic/seismic). MT keeps its own CUDA backend.")
     args = parser.parse_args()
     
@@ -549,6 +554,7 @@ if __name__ == '__main__':
         run_seismic=not args.skip_seismic,
         gravity_anomaly_mode=args.gravity_anomaly_mode,
         gravity_bg_density=args.gravity_bg_density,
+        gravity_algorithm=args.gravity_algorithm,
         torch_device_preference=args.torch_device_preference,
         anomaly_type=args.anomaly_type,
         seismic_preset=args.seismic_preset,

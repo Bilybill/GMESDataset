@@ -52,6 +52,7 @@ def main():
     output_unit = gconf.get("output_unit", "mgal")
     pad_factor = int(gconf.get("pad_factor", 2))
     G = float(gconf.get("G", 6.67430e-11))
+    algorithm = gconf.get("algorithm", "prism_exact")
     obs_conf = gconf.get("observation", {"layout": "grid"})
 
     t0 = time.time()
@@ -66,6 +67,7 @@ def main():
         output_unit=output_unit,
         pad_factor=pad_factor,
         density_unit="g/cm^3",
+        algorithm=algorithm,
     )
     t1 = time.time()
     logger.info(f"Forward done. Output shape={tuple(data.shape)}. Time={(t1 - t0):.2f}s")

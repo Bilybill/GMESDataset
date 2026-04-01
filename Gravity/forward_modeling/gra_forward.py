@@ -1,5 +1,4 @@
-import math
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -57,6 +56,85 @@ def _make_obs_indices(nx: int, ny: int, obs_conf: Dict) -> Tuple[torch.Tensor, t
     raise ValueError(f"Unknown observation.layout: {layout}")
 
 
+def _normalize_algorithm(algorithm: str) -> str:
+    algo = (algorithm or "point_mass_fast").lower()
+    aliases = {
+        "fast": "point_mass_fast",
+        "point_mass": "point_mass_fast",
+        "pointmass": "point_mass_fast",
+        "point_mass_fast": "point_mass_fast",
+        "exact": "prism_exact",
+        "prism": "prism_exact",
+        "prism_exact": "prism_exact",
+    }
+    if algo not in aliases:
+        raise ValueError(
+            f"Unknown gravity algorithm: {algorithm}. "
+            "Use 'point_mass_fast' or 'prism_exact'."
+        )
+    return aliases[algo]
+
+
+def _build_fft_offsets(
+    nx_pad: int,
+    ny_pad: int,
+    dx: float,
+    dy: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    ix = torch.arange(nx_pad, device=device)
+    iy = torch.arange(ny_pad, device=device)
+    ix = torch.where(ix <= nx_pad // 2, ix, ix - nx_pad)
+    iy = torch.where(iy <= ny_pad // 2, iy, iy - ny_pad)
+    x = ix.to(dtype) * float(dx)
+    y = iy.to(dtype) * float(dy)
+    return torch.meshgrid(x, y, indexing="ij")
+
+
+def _prism_gz_antiderivative(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    r = torch.sqrt(x * x + y * y + z * z + eps)
+    tx = torch.clamp(r + x, min=eps)
+    ty = torch.clamp(r + y, min=eps)
+    return x * torch.log(ty) + y * torch.log(tx) - z * torch.atan2(x * y, z * r)
+
+
+def _prism_gz_kernel(
+    x_center: torch.Tensor,
+    y_center: torch.Tensor,
+    *,
+    dx: float,
+    dy: float,
+    z_top: float,
+    z_bottom: float,
+) -> torch.Tensor:
+    half_dx = 0.5 * float(dx)
+    half_dy = 0.5 * float(dy)
+    x1 = x_center - half_dx
+    x2 = x_center + half_dx
+    y1 = y_center - half_dy
+    y2 = y_center + half_dy
+    z1 = torch.full_like(x_center, float(z_top))
+    z2 = torch.full_like(x_center, float(z_bottom))
+    eps = torch.finfo(x_center.dtype).eps
+
+    total = torch.zeros_like(x_center)
+    for xv, sx in ((x1, -1.0), (x2, 1.0)):
+        for yv, sy in ((y1, -1.0), (y2, 1.0)):
+            for zv, sz in ((z1, -1.0), (z2, 1.0)):
+                total = total + (sx * sy * sz) * _prism_gz_antiderivative(xv, yv, zv, eps=eps)
+    # Convert the standard analytic expression to the project convention:
+    # gz is positive downward.
+    return -total
+
+
 def forward_gravity_gz(
     density: torch.Tensor,
     dx: float,
@@ -68,6 +146,7 @@ def forward_gravity_gz(
     output_unit: str = "mgal",
     pad_factor: int = 2,
     density_unit: str = "g/cm^3",
+    algorithm: str = "prism_exact",
 ) -> Tuple[torch.Tensor, Dict]:
     """
     Gravity forward modeling (vertical component gz) for a 3D density model.
@@ -82,10 +161,14 @@ def forward_gravity_gz(
         - points: (1, n_heights, n_points)
       meta: dict with observation indices and parameters.
     Notes:
-      - This is a *point-mass cell-center approximation*:
+      - algorithm="point_mass_fast":
+          *point-mass cell-center approximation*
           dm = rho * dx * dy * dz at each cell center
           gz = G * dm * (z) / r^3
-        It is widely used for fast synthetic dataset generation.
+          It is widely used for fast synthetic dataset generation.
+      - algorithm="prism_exact":
+          exact rectangular-prism gz kernel on a regular grid, evaluated via
+          FFT-based horizontal convolution for each depth layer.
     """
     if density.ndim != 3:
         raise ValueError(f"density must be 3D (nx,ny,nz), got {tuple(density.shape)}")
@@ -104,6 +187,7 @@ def forward_gravity_gz(
     nx, ny, nz = density.shape
     heights = [float(h) for h in (heights_m or [0.0])]
     scale = _unit_scale(output_unit)
+    algorithm = _normalize_algorithm(algorithm)
 
     # Observation indices
     x_idx, y_idx, layout = _make_obs_indices(nx, ny, obs_conf)
@@ -123,6 +207,7 @@ def forward_gravity_gz(
         "internal_density_unit": "kg/m^3",
         "pad_factor": int(pad_factor),
         "model_shape": (nx, ny, nz),
+        "algorithm": algorithm,
     }
 
     # We compute full-field gz on (nx, ny) then sample.
@@ -130,26 +215,25 @@ def forward_gravity_gz(
     nx_pad = int(pad_factor) * nx
     ny_pad = int(pad_factor) * ny
 
+    compute_dtype = torch.float64 if algorithm == "prism_exact" else torch.float32
     # Precompute FFT of density slices in batch: (nx_pad, ny_pad//2+1, nz)
-    rho = density.to(torch.float32)
+    rho = density.to(compute_dtype)
     rho_hat = torch.fft.rfft2(rho, s=(nx_pad, ny_pad), dim=(0, 1))
 
-    # Spatial coordinates for kernel centered at (0,0) using "ifftshift" style grid:
-    # Build offsets in meters for padded grid.
-    # For linear convolution, we want kernel indices aligned with FFT conventions.
-    ix = torch.arange(nx_pad, device=device)
-    iy = torch.arange(ny_pad, device=device)
-    # map indices to signed offsets: [0..N-1] -> [0..N/2, -(N/2-1)..-1]
-    ix = torch.where(ix <= nx_pad // 2, ix, ix - nx_pad)
-    iy = torch.where(iy <= ny_pad // 2, iy, iy - ny_pad)
-    x = ix.to(torch.float32) * float(dx)
-    y = iy.to(torch.float32) * float(dy)
-    X, Y = torch.meshgrid(x, y, indexing="ij")
+    # Spatial coordinates for kernel centered at (0,0) using "ifftshift" style grid.
+    X, Y = _build_fft_offsets(
+        nx_pad,
+        ny_pad,
+        dx,
+        dy,
+        device=device,
+        dtype=compute_dtype,
+    )
     R2_xy = X * X + Y * Y  # (nx_pad, ny_pad)
 
     # Depth centers (z positive downward), observation is above surface at -h,
     # so vertical distance is zc + h.
-    z_centers = (torch.arange(nz, device=device, dtype=torch.float32) + 0.5) * float(dz)  # (nz,)
+    z_centers = (torch.arange(nz, device=device, dtype=compute_dtype) + 0.5) * float(dz)  # (nz,)
 
     # Output container
     if layout == "grid":
@@ -163,10 +247,22 @@ def forward_gravity_gz(
         # Accumulate in frequency domain to reduce inverse FFT calls
         acc_hat = None
         for k in range(nz):
-            z0 = float(z_centers[k].item() + h)  # meters
-            # Kernel K(Δx,Δy; z0) = z0 / (Δx^2+Δy^2+z0^2)^(3/2)
-            denom = (R2_xy + z0 * z0).pow(1.5)
-            K = (z0 / denom).to(torch.float32)
+            if algorithm == "point_mass_fast":
+                z0 = z_centers[k] + float(h)
+                # Kernel K(Δx,Δy; z0) = z0 / (Δx^2+Δy^2+z0^2)^(3/2)
+                denom = (R2_xy + z0 * z0).pow(1.5)
+                K = z0 / denom
+            else:
+                z_top = float(k * dz + h)
+                z_bottom = float((k + 1) * dz + h)
+                K = _prism_gz_kernel(
+                    X,
+                    Y,
+                    dx=dx,
+                    dy=dy,
+                    z_top=z_top,
+                    z_bottom=z_bottom,
+                )
             # FFT of kernel
             K_hat = torch.fft.rfft2(K, s=(nx_pad, ny_pad))
             term_hat = rho_hat[..., k] * K_hat
@@ -174,14 +270,17 @@ def forward_gravity_gz(
 
         gz_full = torch.fft.irfft2(acc_hat, s=(nx_pad, ny_pad))
         # Crop to original size, centered at [0:nx, 0:ny]
-        gz_full = gz_full[:nx, :ny] * cell_mass_scale * scale  # convert unit
+        if algorithm == "point_mass_fast":
+            gz_full = gz_full[:nx, :ny] * cell_mass_scale * scale
+        else:
+            gz_full = gz_full[:nx, :ny] * float(G) * scale
 
         if layout == "grid":
             # sample by indices
             gz_s = gz_full.index_select(0, x_idx).index_select(1, y_idx)  # (n_x, n_y)
-            out[0, hi] = gz_s
+            out[0, hi] = gz_s.to(out.dtype)
         else:
             gz_s = gz_full[x_idx, y_idx]  # (n_points,)
-            out[0, hi] = gz_s
+            out[0, hi] = gz_s.to(out.dtype)
 
     return out, meta

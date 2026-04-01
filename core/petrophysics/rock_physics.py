@@ -20,20 +20,22 @@ class PetrophysicsConverter:
             "density_clip": (1.95, 2.90),
             "vm": 3950.0,
             "vf": 1500.0,
-            "phi0": 0.18,
-            "phi_min": 0.04,
-            "phi_max": 0.22,
-            "compaction": 2.8,
-            "phi_blend": 0.30,
-            "rw_surface": 0.28,
-            "rw_deep": 0.12,
+            "phi0": 0.12,
+            "phi_min": 0.02,
+            "phi_max": 0.16,
+            "compaction": 3.2,
+            "phi_blend": 0.18,
+            "rw_surface": 0.65,
+            "rw_deep": 0.32,
+            "sw_surface": 0.94,
+            "sw_deep": 0.98,
             "archie_a": 1.15,
-            "archie_m": 1.95,
-            "archie_n": 1.85,
-            "clay_base": 0.55,
-            "clay_span": 0.30,
-            "clay_res_base": 4.5,
-            "res_clip": (0.2, 300.0),
+            "archie_m": 2.05,
+            "archie_n": 1.95,
+            "clay_base": 0.34,
+            "clay_span": 0.16,
+            "clay_res_base": 8.0,
+            "res_clip": (2.0, 120.0),
             "chi_mean": 8.0e-5,
             "chi_span": 5.0e-5,
         },
@@ -43,20 +45,22 @@ class PetrophysicsConverter:
             "density_clip": (2.05, 2.85),
             "vm": 5400.0,
             "vf": 1500.0,
-            "phi0": 0.30,
-            "phi_min": 0.03,
-            "phi_max": 0.34,
-            "compaction": 3.5,
-            "phi_blend": 0.60,
-            "rw_surface": 0.24,
-            "rw_deep": 0.09,
+            "phi0": 0.22,
+            "phi_min": 0.02,
+            "phi_max": 0.26,
+            "compaction": 4.0,
+            "phi_blend": 0.35,
+            "rw_surface": 1.10,
+            "rw_deep": 0.48,
+            "sw_surface": 0.64,
+            "sw_deep": 0.88,
             "archie_a": 1.0,
-            "archie_m": 1.90,
-            "archie_n": 1.85,
-            "clay_base": 0.06,
-            "clay_span": 0.16,
-            "clay_res_base": 7.0,
-            "res_clip": (2.0, 2000.0),
+            "archie_m": 2.05,
+            "archie_n": 2.00,
+            "clay_base": 0.02,
+            "clay_span": 0.08,
+            "clay_res_base": 18.0,
+            "res_clip": (25.0, 2500.0),
             "chi_mean": 2.5e-5,
             "chi_span": 1.5e-5,
         },
@@ -66,20 +70,22 @@ class PetrophysicsConverter:
             "density_clip": (2.20, 3.00),
             "vm": 6400.0,
             "vf": 1500.0,
-            "phi0": 0.12,
-            "phi_min": 0.01,
-            "phi_max": 0.18,
-            "compaction": 4.6,
-            "phi_blend": 0.55,
-            "rw_surface": 0.30,
-            "rw_deep": 0.12,
+            "phi0": 0.08,
+            "phi_min": 0.005,
+            "phi_max": 0.12,
+            "compaction": 5.2,
+            "phi_blend": 0.30,
+            "rw_surface": 1.60,
+            "rw_deep": 0.72,
+            "sw_surface": 0.38,
+            "sw_deep": 0.72,
             "archie_a": 0.95,
-            "archie_m": 2.20,
-            "archie_n": 2.0,
-            "clay_base": 0.01,
-            "clay_span": 0.05,
-            "clay_res_base": 15.0,
-            "res_clip": (20.0, 5000.0),
+            "archie_m": 2.35,
+            "archie_n": 2.15,
+            "clay_base": 0.0,
+            "clay_span": 0.02,
+            "clay_res_base": 40.0,
+            "res_clip": (150.0, 15000.0),
             "chi_mean": 8.0e-6,
             "chi_span": 8.0e-6,
         },
@@ -116,12 +122,41 @@ class PetrophysicsConverter:
         facies[score >= 0.72] = self.FACIES_CARBONATE
         return facies
 
+    def _layer_base_facies_from_score(self, score):
+        facies = np.full(score.shape, self.FACIES_SANDSTONE, dtype=np.int16)
+        facies[score < 0.34] = self.FACIES_SHALE
+        facies[score >= 0.68] = self.FACIES_CARBONATE
+        return facies
+
+    def _refine_layer_facies(self, base_facies, local_score):
+        cell_facies = np.full(local_score.shape, base_facies, dtype=np.int16)
+        if base_facies == self.FACIES_SHALE:
+            cell_facies[local_score > 0.62] = self.FACIES_SANDSTONE
+        elif base_facies == self.FACIES_SANDSTONE:
+            cell_facies[local_score < 0.28] = self.FACIES_SHALE
+            cell_facies[local_score > 0.80] = self.FACIES_CARBONATE
+        elif base_facies == self.FACIES_CARBONATE:
+            cell_facies[local_score < 0.44] = self.FACIES_SANDSTONE
+        return cell_facies
+
     def _infer_facies_model(self, vp_model, label_vol):
         depth_norm = self._depth_norm(vp_model.shape)
         vp_norm = self._vp_norm(vp_model)
         labels = np.unique(label_vol.astype(np.int32))
         label_summary = {}
         facies = np.full(vp_model.shape, self.FACIES_SANDSTONE, dtype=np.int16)
+        layer_noise = self._generate_correlated_noise(vp_model.shape, sigma=12.0)
+
+        if labels.size <= 1:
+            global_score = 0.60 * vp_norm + 0.40 * depth_norm + 0.03 * layer_noise
+            facies = self._layer_base_facies_from_score(global_score)
+            label_summary[int(labels[0]) if labels.size == 1 else 0] = {
+                "base_facies": "mixed",
+                "median_vp_norm": float(np.median(vp_norm)),
+                "median_depth_norm": float(np.median(depth_norm)),
+                "score": float(np.median(global_score)),
+            }
+            return facies, label_summary, depth_norm, vp_norm
 
         for label in labels:
             mask = label_vol == label
@@ -132,17 +167,15 @@ class PetrophysicsConverter:
             label_depth = depth_norm[mask]
             label_vp_med = float(np.median(label_vp))
             label_depth_med = float(np.median(label_depth))
-            label_score = 0.70 * label_vp_med + 0.30 * label_depth_med
-            base_facies = int(self._facies_from_score(np.array([label_score], dtype=np.float32))[0])
-
-            # cell_score = 0.55 * vp_norm[mask] + 0.30 * label_score + 0.15 * depth_norm[mask]
-            cell_score = 0.65 * vp_norm[mask] + 0.35 * label_score
-            cell_facies = self._facies_from_score(cell_score)
-
-            if base_facies == self.FACIES_SHALE:
-                cell_facies = np.minimum(cell_facies, self.FACIES_SANDSTONE)
-            elif base_facies == self.FACIES_CARBONATE:
-                cell_facies = np.maximum(cell_facies, self.FACIES_SANDSTONE)
+            label_score = 0.55 * label_vp_med + 0.45 * label_depth_med
+            base_facies = int(self._layer_base_facies_from_score(np.array([label_score], dtype=np.float32))[0])
+            local_score = (
+                0.18 * vp_norm[mask]
+                + 0.12 * depth_norm[mask]
+                + 0.70 * label_score
+                + 0.03 * layer_noise[mask]
+            )
+            cell_facies = self._refine_layer_facies(base_facies, local_score)
 
             facies[mask] = cell_facies
             label_summary[int(label)] = {
@@ -164,6 +197,7 @@ class PetrophysicsConverter:
 
         noise_phi = self._generate_correlated_noise(shape, sigma=10.0)
         noise_rw = self._generate_correlated_noise(shape, sigma=14.0)
+        noise_sw = self._generate_correlated_noise(shape, sigma=12.0)
         noise_rho = self._generate_correlated_noise(shape, sigma=8.0)
         noise_chi = self._generate_correlated_noise(shape, sigma=6.0)
 
@@ -187,6 +221,10 @@ class PetrophysicsConverter:
             rw_local = params["rw_surface"] + (params["rw_deep"] - params["rw_surface"]) * depth_local
             rw_local = rw_local * np.exp(0.08 * noise_rw[mask])
             rw_model[mask] = np.clip(rw_local, 0.03, 2.5)
+
+            sw_local = params["sw_surface"] + (params["sw_deep"] - params["sw_surface"]) * depth_local
+            sw_local = sw_local + 0.03 * noise_sw[mask]
+            sw_model[mask] = np.clip(sw_local, 0.15, 1.0)
 
             rho_local = params["density_a"] * np.power(np.clip(vp_local, 1200.0, None), params["density_b"])
             rho_local = rho_local * np.exp(0.035 * noise_rho[mask])
@@ -216,7 +254,7 @@ class PetrophysicsConverter:
             clay_frac = np.clip(clay_frac, 0.0, 0.95)
             rho_sh = params["clay_res_base"] * (1.0 + 0.35 * depth_local)
             sigma_clay = clay_frac / np.clip(rho_sh, 0.1, None)
-            sigma_total = sigma_clean * (1.0 - 0.5 * clay_frac) + sigma_clay
+            sigma_total = sigma_clean * (1.0 - 0.25 * clay_frac) + sigma_clay
             res_local = 1.0 / np.clip(sigma_total, 1.0e-6, None)
             res_model[mask] = np.clip(res_local, *params["res_clip"])
 

@@ -5,7 +5,7 @@ class MagneticForwardSolver(BaseForwardSolver):
     """
     Magnetic Forward Modeling Solver (Total Magnetic Intensity).
     """
-    def __init__(self, dx, dy, dz, heights_m, obs_conf, inc, dec, inc0=None, dec0=None, B0=50000.0, output_unit="nt", pad_factor=2, input_type="susceptibility", algorithm="prism_matched"):
+    def __init__(self, dx, dy, dz, heights_m, obs_conf, inc, dec, inc0=None, dec0=None, B0=50000.0, output_unit="nt", pad_factor=2, input_type="susceptibility", algorithm="standard_B"):
         super().__init__()
         self.dx = dx
         self.dy = dy
