@@ -91,13 +91,20 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return config
 
-def load_velocity_model(config):
+def load_velocity_volume(path, shape, model_conf=None):
     """
-    Loads velocity model from file or creates a dummy one if file doesn't exist.
+    Load a velocity volume from path using the same rules as ``load_velocity_model``.
+
+    Parameters
+    ----------
+    path:
+        Input file path. Supports ``.npy``, ``.npz``, ``.bin``, ``.sgy``, ``.segy``.
+    shape:
+        Target volume shape, typically ``[nx, ny, nz]`` for 3D.
+    model_conf:
+        Optional model config dict used by composite ``.npz`` scaling logic.
     """
-    path = config['model']['file_path']
-    shape = config['model']['shape']
-    
+    model_conf = model_conf or {}
     if os.path.exists(path):
         if path.endswith('.npy'):
             v = np.load(path)
@@ -111,7 +118,6 @@ def load_velocity_model(config):
                 Trends = data['gtime']
                 
                 # Retrieve ranges from config or use defaults from read_npz_2_segy.py
-                model_conf = config.get('model', {})
                 trends_range = model_conf.get('trends_range', (2000, 6000))
                 details_range = model_conf.get('details_range', (-500, 1000))
                 mdetails_range = model_conf.get('mdetails_range', (-200, 200))
@@ -181,7 +187,17 @@ def load_velocity_model(config):
     else:
         logger.warning(f"Warning: Velocity file {path} not found. Using constant velocity model for testing.")
         v = np.ones(shape) * 2000.0  # Default 2000 m/s
-    
+
+    return np.asarray(v, dtype=np.float32)
+
+
+def load_velocity_model(config):
+    """
+    Loads velocity model from file or creates a dummy one if file doesn't exist.
+    """
+    path = config['model']['file_path']
+    shape = config['model']['shape']
+    v = load_velocity_volume(path, shape, model_conf=config.get('model', {}))
     return torch.tensor(v, dtype=torch.float32)
 
 def get_wavelet(config, device):

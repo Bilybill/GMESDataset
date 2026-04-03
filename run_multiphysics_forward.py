@@ -1,13 +1,24 @@
 import argparse
+import json
 import os
 import time
 import numpy as np
 import torch
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "matplotlib-gmesdataset"))
+
 import matplotlib.pyplot as plt
 
 from core.multiphysics import build_multiphysics_model
-from core.presets import FORWARD_ANOMALY_TYPES, build_named_anomaly_preset, read_segy_volume
-from Seismic.forward_modeling.utils import get_wavelet, setup_acquisition
+from core.label_volume import load_label_volume_from_sample_npz
+from core.presets import (
+    DEFAULT_SEGY_SPACING,
+    FORWARD_ANOMALY_TYPES,
+    build_named_anomaly_preset,
+    load_anomaly_randomization_config,
+    read_segy_volume,
+)
+from Seismic.forward_modeling.utils import get_wavelet, setup_acquisition, load_velocity_volume
 
 from core.forward_modeling.gravity import GravityForwardSolver
 from core.forward_modeling.magnetic import MagneticForwardSolver
@@ -212,28 +223,36 @@ def _resolve_mt_frequency_list(mt_freq_min, mt_freq_max):
         raise ValueError("MT frequency bounds must be positive.")
     return generate_mt_frequencies(mt_freq_min, mt_freq_max)
 
-def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
-    """读取 SEGY 构建指定异常体的四参数模型，用于四法联合正演基准。"""
-    try:
-        vp_bg, (dx, dy, dz) = read_segy_volume(vp_segy_path)
-        label_vol, _ = read_segy_volume(label_segy_path)
-        nx, ny, nz = vp_bg.shape
-        print(f'Velocity shape = {nx, ny, nz}, dx={dx}, dy={dy}, dz={dz}')
-    except Exception as e:
-        raise RuntimeError(f"Failed to read SEGY volumes: {e}")
+def _build_model_dict(vp_bg, label_vol, spacing, anomaly_type="igneous_swarm", source_meta=None, anomaly_random_config=None):
+    vp_bg = np.asarray(vp_bg, dtype=np.float32)
+    label_arr = None if label_vol is None else np.asarray(label_vol, dtype=np.int32)
+    dx, dy, dz = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+    nx, ny, nz = vp_bg.shape
+    print(f'Velocity shape = {nx, ny, nz}, dx={dx}, dy={dy}, dz={dz}')
 
-    preset = build_named_anomaly_preset(anomaly_type, vp_bg, label_vol, (dx, dy, dz))
+    source_meta = dict(source_meta or {})
+    preset = build_named_anomaly_preset(
+        anomaly_type,
+        vp_bg,
+        label_arr,
+        (dx, dy, dz),
+        source_relpath=source_meta.get("source_relpath"),
+        variant_index=int(source_meta.get("anomaly_variant_index", 0)),
+        seed_offset=int(source_meta.get("anomaly_seed_offset", 0)),
+        randomization_config=anomaly_random_config,
+    )
     print(f"Selected anomaly: {preset.name_en} ({preset.name_zh}) [{preset.key}]")
 
-    models = build_multiphysics_model(vp_bg, label_vol, [preset.anomaly], dx, dy, dz)
+    models = build_multiphysics_model(vp_bg, label_arr, [preset.anomaly], dx, dy, dz)
     print(f'背景密度 value range = {models["rho_bg"].min():.2f} - {models["rho_bg"].max():.2f} {DENSITY_UNIT}')
     print(f'背景电阻率 value range = {models["resist_bg"].min():.2e} - {models["resist_bg"].max():.2e} Ohm-m')
 
-    return {
+    result = {
         "vp": models["vp"],
         "rho": models["rho"],
         "res": models["resist"],
         "chi": models["chi"],
+        "label_vol": None if label_arr is None else label_arr.astype(np.int16, copy=False),
         "rho_bg": models["rho_bg"],
         "chi_bg": models["chi_bg"],
         "anomaly_label": models["anomaly_label"],
@@ -243,33 +262,103 @@ def generate_model(vp_segy_path, label_segy_path, anomaly_type="igneous_swarm"):
         "anomaly_type": preset.key,
         "anomaly_name_en": preset.name_en,
         "anomaly_name_zh": preset.name_zh,
+        "anomaly_seed": None if preset.rng_seed is None else int(preset.rng_seed),
+        "anomaly_params_json": None if preset.params_dict is None else json.dumps(preset.params_dict, ensure_ascii=False, sort_keys=True),
     }
+    for key, value in source_meta.items():
+        if value is not None:
+            result[key] = value
+    return result
 
-def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None):
-    print("====== 1. 模型生成 ======")
-    gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
-    model = generate_model(vp_segy_path, label_segy_path, anomaly_type=anomaly_type)
-    vp_multi = model["vp"]
-    rho_multi = model["rho"]
-    res_multi = model["res"]
-    chi_multi = model["chi"]
-    rho_bg_arr = model["rho_bg"]
-    chi_bg_arr = model["chi_bg"]
-    facies_bg = model["facies_bg"]
-    nx, ny, nz = model["shape"]
-    dx, dy, dz = model["spacing"]
-    print(
-        f"Generated Models: {nx}x{ny}x{nz} (dx={dx}, dy={dy}, dz={dz}) "
-        f"for {model['anomaly_name_en']} ({model['anomaly_name_zh']})."
+
+def generate_model_from_volumes(vp_bg, label_vol=None, spacing=DEFAULT_SEGY_SPACING, anomaly_type="igneous_swarm", source_meta=None, anomaly_random_config=None):
+    """从内存中的速度/层位体直接构建四参数模型。"""
+    return _build_model_dict(
+        vp_bg,
+        label_vol,
+        spacing,
+        anomaly_type=anomaly_type,
+        source_meta=source_meta,
+        anomaly_random_config=anomaly_random_config,
     )
 
+
+def generate_model_from_velocity_file(vp_path, velocity_shape, spacing=DEFAULT_SEGY_SPACING, anomaly_type="igneous_swarm", label_path=None, sample_npz_path=None, label_contour_num=12, source_meta=None, anomaly_random_config=None):
+    """从 .bin/.npy/.npz/.sgy/.segy 速度体构建四参数模型。"""
+    vp_bg = load_velocity_volume(vp_path, list(velocity_shape))
+    label_vol = None
+    label_levels = None
+    label_source_kind = "none"
+    if label_path:
+        label_vol = load_velocity_volume(label_path, list(velocity_shape))
+        label_source_kind = "precomputed_label"
+    elif sample_npz_path:
+        label_vol, label_levels = load_label_volume_from_sample_npz(sample_npz_path, contour_num=label_contour_num)
+        label_source_kind = "sample_gtime_digitized"
+        if tuple(label_vol.shape) != tuple(vp_bg.shape):
+            raise ValueError(
+                f"Sample-derived label volume shape {label_vol.shape} does not match velocity shape {vp_bg.shape} "
+                f"for {sample_npz_path}"
+            )
+    merged_source_meta = {
+        "source_velocity_path": os.path.abspath(vp_path),
+        "source_label_path": None if label_path is None else os.path.abspath(label_path),
+        "label_source_path": None if sample_npz_path is None else os.path.abspath(sample_npz_path),
+        "label_source_kind": label_source_kind,
+        "label_contour_num": int(label_contour_num),
+        "label_levels": None if label_levels is None else np.asarray(label_levels, dtype=np.float32),
+        "source_format": os.path.splitext(vp_path)[1].lower(),
+    }
+    for key, value in dict(source_meta or {}).items():
+        if value is not None:
+            merged_source_meta[key] = value
+    return generate_model_from_volumes(
+        vp_bg,
+        label_vol=label_vol,
+        spacing=spacing,
+        anomaly_type=anomaly_type,
+        source_meta=merged_source_meta,
+        anomaly_random_config=anomaly_random_config,
+    )
+
+
+def generate_model(vp_segy_path, label_segy_path=None, anomaly_type="igneous_swarm", anomaly_random_config=None):
+    """读取 SEGY 构建指定异常体的四参数模型，用于四法联合正演基准。"""
+    try:
+        vp_bg, (dx, dy, dz) = read_segy_volume(vp_segy_path)
+        label_vol = None
+        if label_segy_path:
+            label_vol, _ = read_segy_volume(label_segy_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read SEGY volumes: {e}")
+
+    source_meta = {
+        "source_velocity_path": os.path.abspath(vp_segy_path),
+        "source_label_path": None if label_segy_path is None else os.path.abspath(label_segy_path),
+        "source_format": os.path.splitext(vp_segy_path)[1].lower(),
+    }
+    return generate_model_from_volumes(
+        vp_bg,
+        label_vol=label_vol,
+        spacing=(dx, dy, dz),
+        anomaly_type=anomaly_type,
+        source_meta=source_meta,
+        anomaly_random_config=anomaly_random_config,
+    )
+
+
+def _create_base_bundle(model, gravity_algorithm, seismic_preset, seismic_batch_size):
+    facies_bg = model["facies_bg"]
+    label_vol = model.get("label_vol")
+    dx, dy, dz = model["spacing"]
     bundle = {
-        "vp_model": np.asarray(vp_multi, dtype=np.float32),
-        "rho_model": np.asarray(rho_multi, dtype=np.float32),
-        "res_model": np.asarray(res_multi, dtype=np.float32),
-        "chi_model": np.asarray(chi_multi, dtype=np.float32),
-        "rho_bg_model": np.asarray(rho_bg_arr, dtype=np.float32),
-        "chi_bg_model": np.asarray(chi_bg_arr, dtype=np.float32),
+        "vp_model": np.asarray(model["vp"], dtype=np.float32),
+        "rho_model": np.asarray(model["rho"], dtype=np.float32),
+        "res_model": np.asarray(model["res"], dtype=np.float32),
+        "chi_model": np.asarray(model["chi"], dtype=np.float32),
+        "label_volume": np.asarray(label_vol, dtype=np.int16) if label_vol is not None else np.empty((0,), dtype=np.int16),
+        "rho_bg_model": np.asarray(model["rho_bg"], dtype=np.float32),
+        "chi_bg_model": np.asarray(model["chi_bg"], dtype=np.float32),
         "anomaly_label": np.asarray(model["anomaly_label"], dtype=np.int16),
         "facies_bg": np.asarray(facies_bg, dtype=np.int16) if facies_bg is not None else np.empty((0,), dtype=np.int16),
         "dx": np.array(dx, dtype=np.float32),
@@ -287,6 +376,121 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         "seismic_preset": np.array(str(seismic_preset)),
         "seismic_batch_size": np.array(int(seismic_batch_size), dtype=np.int32),
     }
+    for key in (
+        "source_velocity_path",
+        "source_label_path",
+        "label_source_path",
+        "label_source_kind",
+        "label_contour_num",
+        "label_levels",
+        "source_format",
+        "source_relpath",
+        "anomaly_variant_index",
+        "anomaly_seed_offset",
+        "anomaly_seed",
+        "anomaly_params_json",
+        "anomaly_random_config_path",
+    ):
+        value = model.get(key)
+        if value is not None:
+            bundle[key] = np.array(value)
+    return bundle
+
+
+def _scalar_or_array(npz_data, key, default=None):
+    if key not in npz_data.files:
+        return default
+    value = np.asarray(npz_data[key])
+    return value.item() if value.shape == () else value
+
+
+def load_model_bundle(bundle_path):
+    with np.load(bundle_path, allow_pickle=True) as data:
+        vp = np.asarray(data["vp_model"], dtype=np.float32)
+        rho = np.asarray(data["rho_model"], dtype=np.float32)
+        res = np.asarray(data["res_model"], dtype=np.float32)
+        chi = np.asarray(data["chi_model"], dtype=np.float32)
+        rho_bg = np.asarray(data["rho_bg_model"], dtype=np.float32)
+        chi_bg = np.asarray(data["chi_bg_model"], dtype=np.float32)
+        anomaly_label = np.asarray(data["anomaly_label"], dtype=np.int16)
+
+        label_vol = np.asarray(data["label_volume"], dtype=np.int16) if "label_volume" in data.files else np.empty((0,), dtype=np.int16)
+        if label_vol.size == 0:
+            label_vol = None
+
+        facies_bg = np.asarray(data["facies_bg"], dtype=np.int16) if "facies_bg" in data.files else np.empty((0,), dtype=np.int16)
+        if facies_bg.size == 0:
+            facies_bg = None
+
+        model = {
+            "vp": vp,
+            "rho": rho,
+            "res": res,
+            "chi": chi,
+            "label_vol": label_vol,
+            "rho_bg": rho_bg,
+            "chi_bg": chi_bg,
+            "anomaly_label": anomaly_label,
+            "shape": tuple(vp.shape),
+            "spacing": (
+                float(_scalar_or_array(data, "dx", 1.0)),
+                float(_scalar_or_array(data, "dy", 1.0)),
+                float(_scalar_or_array(data, "dz", 1.0)),
+            ),
+            "facies_bg": facies_bg,
+            "anomaly_type": str(_scalar_or_array(data, "anomaly_type", "unknown")),
+            "anomaly_name_en": str(_scalar_or_array(data, "anomaly_name_en", "Unknown")),
+            "anomaly_name_zh": str(_scalar_or_array(data, "anomaly_name_zh", "未知")),
+        }
+
+        for key in (
+            "source_velocity_path",
+            "source_label_path",
+            "label_source_path",
+            "label_source_kind",
+            "label_contour_num",
+            "label_levels",
+            "source_format",
+            "source_relpath",
+            "anomaly_variant_index",
+            "anomaly_seed_offset",
+            "anomaly_seed",
+            "anomaly_params_json",
+            "anomaly_random_config_path",
+        ):
+            value = _scalar_or_array(data, key, None)
+            if value is not None:
+                model[key] = value
+    return model
+
+
+def save_model_bundle(model, save_dir, gravity_algorithm="prism_exact", seismic_preset="full", seismic_batch_size=0, filename="model_bundle.npz"):
+    os.makedirs(save_dir, exist_ok=True)
+    bundle = _create_base_bundle(model, gravity_algorithm, seismic_preset, seismic_batch_size)
+    bundle_path = os.path.join(save_dir, filename)
+    np.savez(bundle_path, **bundle)
+    print(f"[+] Saved model bundle to: {bundle_path}")
+    return bundle_path
+
+
+def run_forward_pipeline_from_model(save_dir, model, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None, save_previews=True):
+    os.makedirs(save_dir, exist_ok=True)
+    gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
+    vp_multi = model["vp"]
+    rho_multi = model["rho"]
+    res_multi = model["res"]
+    chi_multi = model["chi"]
+    rho_bg_arr = model["rho_bg"]
+    chi_bg_arr = model["chi_bg"]
+    facies_bg = model["facies_bg"]
+    nx, ny, nz = model["shape"]
+    dx, dy, dz = model["spacing"]
+    print(
+        f"Generated Models: {nx}x{ny}x{nz} (dx={dx}, dy={dy}, dz={dz}) "
+        f"for {model['anomaly_name_en']} ({model['anomaly_name_zh']})."
+    )
+
+    bundle = _create_base_bundle(model, gravity_algorithm, seismic_preset, seismic_batch_size)
     
     # 主模型常驻 CPU，分模块按需搬运，避免某个 CUDA 扩展失败后影响后续模块。
     runtime_device, device_message = _resolve_torch_device(torch_device_preference)
@@ -316,18 +520,19 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         print(f"Down sampled res value range : {res_down.min().item():.2e} - {res_down.max().item():.2e} Ohm-m")
         print(f"Down sampled res median / p95 : {torch.median(res_down).item():.2e} / {torch.quantile(res_down, 0.95).item():.2e} Ohm-m")
 
-        _save_mt_xz_slice(
-            res_down,
-            (mt_dx, mt_dy, mt_dz),
-            os.path.join(save_dir, "mt_res_downsampled_xz_slice.png"),
-            log_scale=True,
-        )
-        _save_mt_xz_slice(
-            res_down,
-            (mt_dx, mt_dy, mt_dz),
-            os.path.join(save_dir, "mt_res_downsampled_xz_slice_linear.png"),
-            log_scale=False,
-        )
+        if save_previews:
+            _save_mt_xz_slice(
+                res_down,
+                (mt_dx, mt_dy, mt_dz),
+                os.path.join(save_dir, "mt_res_downsampled_xz_slice.png"),
+                log_scale=True,
+            )
+            _save_mt_xz_slice(
+                res_down,
+                (mt_dx, mt_dy, mt_dz),
+                os.path.join(save_dir, "mt_res_downsampled_xz_slice_linear.png"),
+                log_scale=False,
+            )
 
         mt_freqs = _resolve_mt_frequency_list(mt_freq_min, mt_freq_max)
         if mt_freqs is None:
@@ -364,8 +569,7 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
             if runtime_device.type == "cuda":
                 runtime_device = torch.device("cpu")
                 print("  --> MT failed after CUDA preprocessing; subsequent Torch modules will continue on CPU.")
-
-    step_idx += 1
+        step_idx += 1
     if run_gravity:
         print(f"\n====== {step_idx}. 重力正演 (Gravity) ======")
         gravity_device = runtime_device
@@ -395,14 +599,14 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         bundle["gravity_status"] = np.array("ok")
         bundle["gravity_data"] = grav_np.astype(np.float32, copy=False)
         
-        plt.figure(figsize=(6,5))
-        plt.imshow(grav_np.T, origin='lower', cmap='jet')
-        plt.colorbar(label='mGal')
-        plt.title('Gravity Anomaly (gz)')
-        plt.savefig(os.path.join(save_dir, "forward_gravity.png"), dpi=150)
-        plt.close()
-
-    step_idx += 1
+        if save_previews:
+            plt.figure(figsize=(6,5))
+            plt.imshow(grav_np.T, origin='lower', cmap='jet')
+            plt.colorbar(label='mGal')
+            plt.title('Gravity Anomaly (gz)')
+            plt.savefig(os.path.join(save_dir, "forward_gravity.png"), dpi=150)
+            plt.close()
+        step_idx += 1
     if run_magnetic:
         print(f"\n====== {step_idx}. 磁力正演 (Magnetic) ======")
         magnetic_device = runtime_device
@@ -437,14 +641,14 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         bundle["magnetic_status"] = np.array("ok")
         bundle["magnetic_data"] = mag_np.astype(np.float32, copy=False)
         
-        plt.figure(figsize=(6,5))
-        plt.imshow(mag_np.T, origin='lower', cmap='jet')
-        plt.colorbar(label='nT')
-        plt.title('Magnetic Anomaly (TMI)')
-        plt.savefig(os.path.join(save_dir, "forward_magnetic.png"), dpi=150)
-        plt.close()
-
-    step_idx += 1
+        if save_previews:
+            plt.figure(figsize=(6,5))
+            plt.imshow(mag_np.T, origin='lower', cmap='jet')
+            plt.colorbar(label='nT')
+            plt.title('Magnetic Anomaly (TMI)')
+            plt.savefig(os.path.join(save_dir, "forward_magnetic.png"), dpi=150)
+            plt.close()
+        step_idx += 1
     if run_seismic:
         print(f"\n====== {step_idx}. 地震正演 (Seismic - 3D) ======")
         seismic_device = runtime_device
@@ -509,23 +713,48 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
             seis_np = seis_data.cpu().numpy().astype(np.float32, copy=False)
             bundle["seismic_status"] = np.array("ok")
             bundle["seismic_data"] = seis_np
-            vmin, vmax = np.percentile(seis_np, [0.5, 99.5])
-            
-            plt.figure(figsize=(6,5))
-            plt.imshow(seis_np[0].T, aspect='auto', cmap='gray', vmin=vmin, vmax=vmax)
-            plt.title('Seismic Shot Gather (3D, Shot 0)')
-            plt.savefig(os.path.join(save_dir, "forward_seismic.png"), dpi=150)
-            plt.close()
+            if save_previews:
+                vmin, vmax = np.percentile(seis_np, [0.5, 99.5])
+                plt.figure(figsize=(6,5))
+                plt.imshow(seis_np[0].T, aspect='auto', cmap='gray', vmin=vmin, vmax=vmax)
+                plt.title('Seismic Shot Gather (3D, Shot 0)')
+                plt.savefig(os.path.join(save_dir, "forward_seismic.png"), dpi=150)
+                plt.close()
         except Exception as e:
             print(f"Seismic Forward failed (ensure Deepwave installed): {e}")
             bundle["seismic_status"] = np.array("failed")
             bundle["seismic_error"] = np.array(str(e))
             raise e  # Seismic failure is critical, re-raise to halt pipeline. Comment out this line if you want to proceed with saving the bundle even if seismic forward fails.
+        step_idx += 1
             
     bundle_path = os.path.join(save_dir, "forward_bundle.npz")
     np.savez(bundle_path, **bundle)
     print(f"[+] Saved unified forward bundle to: {bundle_path}")
     print("\n====== All Done! ======")
+    return bundle_path
+
+
+def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None, save_previews=True, anomaly_random_config=None):
+    print("====== 1. 模型生成 ======")
+    gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
+    model = generate_model(vp_segy_path, label_segy_path, anomaly_type=anomaly_type, anomaly_random_config=anomaly_random_config)
+    return run_forward_pipeline_from_model(
+        save_dir,
+        model,
+        run_gravity=run_gravity,
+        run_magnetic=run_magnetic,
+        run_electrical=run_electrical,
+        run_seismic=run_seismic,
+        gravity_anomaly_mode=gravity_anomaly_mode,
+        gravity_bg_density=gravity_bg_density,
+        gravity_algorithm=gravity_algorithm,
+        torch_device_preference=torch_device_preference,
+        seismic_preset=seismic_preset,
+        seismic_batch_size=seismic_batch_size,
+        mt_freq_min=mt_freq_min,
+        mt_freq_max=mt_freq_max,
+        save_previews=save_previews,
+    )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -543,9 +772,11 @@ if __name__ == '__main__':
     parser.add_argument("--bg_density", dest="gravity_bg_density", type=float, default=2.67, help="Constant bulk density in g/cm^3 to subtract for 'constant' mode.")
     parser.add_argument("--gravity-algorithm", dest="gravity_algorithm", type=str, default="prism_exact", choices=["point_mass_fast", "prism_exact"], help="Gravity forward kernel: fast point-mass approximation or exact rectangular-prism kernel.")
     parser.add_argument("--device", dest="torch_device_preference", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device for Torch-based modules (gravity/magnetic/seismic). MT keeps its own CUDA backend.")
+    parser.add_argument("--anomaly-random-config", dest="anomaly_random_config", type=str, default=None, help="Optional YAML file overriding anomaly randomization ranges.")
     args = parser.parse_args()
     
     os.makedirs(args.save_dir, exist_ok=True)
+    anomaly_random_config = load_anomaly_randomization_config(args.anomaly_random_config) if args.anomaly_random_config else None
     run_forward_pipeline(
         args.save_dir, 
         args.vp_segy,
@@ -561,4 +792,5 @@ if __name__ == '__main__':
         seismic_batch_size=args.seismic_batch_size,
         mt_freq_min=args.mt_freq_min,
         mt_freq_max=args.mt_freq_max,
+        anomaly_random_config=anomaly_random_config,
     )
