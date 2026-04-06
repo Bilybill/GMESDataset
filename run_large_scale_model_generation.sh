@@ -26,12 +26,27 @@ cd /home/wangyh/Project/GMESUni/GMESDataset
 #   --stop-on-error
 
 
+# python build_pretraining_dataset.py \
+#   --stage models \
+#   --velocity-root "$VELOCITY_ROOT" \
+#   --sample-root "$SAMPLE_ROOT" \
+#   --output-root "$OUTPUT_ROOT" \
+#   --split-dirs train-choas \
+#   --anomaly-types igneous_swarm igneous_stock gas hydrate brine_fault massive_sulfide salt_dome sediment_basement serpentinized \
+#   --anomaly-selection-mode random_one \
+#   --variants-per-model "$VARIANTS_PER_MODEL" \
+#   --seed-offset "$SEED_OFFSET" \
+#   --anomaly-random-config "$ANOMALY_RANDOM_CONFIG" \
+#   --resume \
+#   --stop-on-error
+
+  
 python build_pretraining_dataset.py \
   --stage models \
   --velocity-root "$VELOCITY_ROOT" \
   --sample-root "$SAMPLE_ROOT" \
   --output-root "$OUTPUT_ROOT" \
-  --split-dirs train-choas \
+  --split-dirs tests-river \
   --anomaly-types igneous_swarm igneous_stock gas hydrate brine_fault massive_sulfide salt_dome sediment_basement serpentinized \
   --anomaly-selection-mode random_one \
   --variants-per-model "$VARIANTS_PER_MODEL" \
@@ -46,22 +61,7 @@ python build_pretraining_dataset.py \
   --velocity-root "$VELOCITY_ROOT" \
   --sample-root "$SAMPLE_ROOT" \
   --output-root "$OUTPUT_ROOT" \
-  --split-dirs test-river \
-  --anomaly-types igneous_swarm igneous_stock gas hydrate brine_fault massive_sulfide salt_dome sediment_basement serpentinized \
-  --anomaly-selection-mode random_one \
-  --variants-per-model "$VARIANTS_PER_MODEL" \
-  --seed-offset "$SEED_OFFSET" \
-  --anomaly-random-config "$ANOMALY_RANDOM_CONFIG" \
-  --resume \
-  --stop-on-error
-
-  
-python build_pretraining_dataset.py \
-  --stage models \
-  --velocity-root "$VELOCITY_ROOT" \
-  --sample-root "$SAMPLE_ROOT" \
-  --output-root "$OUTPUT_ROOT" \
-  --split-dirs test-choas \
+  --split-dirs tests-choas \
   --anomaly-types igneous_swarm igneous_stock gas hydrate brine_fault massive_sulfide salt_dome sediment_basement serpentinized \
   --anomaly-selection-mode random_one \
   --variants-per-model "$VARIANTS_PER_MODEL" \
