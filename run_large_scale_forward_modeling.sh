@@ -59,10 +59,49 @@ done
 echo "GPU ${GPU_INDEX} is idle. Starting forward modeling now."
 export CUDA_VISIBLE_DEVICES="${GPU_INDEX}"
 
+# python run_pretraining_forward_from_models.py \
+#   --model-root "$MODEL_ROOT" \
+#   ${FORWARD_ROOT:+--forward-root "$FORWARD_ROOT"} \
+#   --split-dirs tests-river \
+#   --device "$DEVICE" \
+#   --gravity-algorithm "$GRAVITY_ALGORITHM" \
+#   --seismic-freq-min "$SEISMIC_FREQ_MIN" \
+#   --seismic-freq-max "$SEISMIC_FREQ_MAX" \
+#   --seismic-preset "$SEISMIC_PRESET" \
+#   --seismic-batch-size "$SEISMIC_BATCH_SIZE" \
+#   --resume \
+#   --stop-on-error
+
 python run_pretraining_forward_from_models.py \
   --model-root "$MODEL_ROOT" \
   ${FORWARD_ROOT:+--forward-root "$FORWARD_ROOT"} \
-  --split-dirs tests-river \
+  --split-dirs tests-choas \
+  --device "$DEVICE" \
+  --gravity-algorithm "$GRAVITY_ALGORITHM" \
+  --seismic-freq-min "$SEISMIC_FREQ_MIN" \
+  --seismic-freq-max "$SEISMIC_FREQ_MAX" \
+  --seismic-preset "$SEISMIC_PRESET" \
+  --seismic-batch-size "$SEISMIC_BATCH_SIZE" \
+  --resume \
+  --stop-on-error
+
+python run_pretraining_forward_from_models.py \
+  --model-root "$MODEL_ROOT" \
+  ${FORWARD_ROOT:+--forward-root "$FORWARD_ROOT"} \
+  --split-dirs train-river \
+  --device "$DEVICE" \
+  --gravity-algorithm "$GRAVITY_ALGORITHM" \
+  --seismic-freq-min "$SEISMIC_FREQ_MIN" \
+  --seismic-freq-max "$SEISMIC_FREQ_MAX" \
+  --seismic-preset "$SEISMIC_PRESET" \
+  --seismic-batch-size "$SEISMIC_BATCH_SIZE" \
+  --resume \
+  --stop-on-error
+
+python run_pretraining_forward_from_models.py \
+  --model-root "$MODEL_ROOT" \
+  ${FORWARD_ROOT:+--forward-root "$FORWARD_ROOT"} \
+  --split-dirs train-choas \
   --device "$DEVICE" \
   --gravity-algorithm "$GRAVITY_ALGORITHM" \
   --seismic-freq-min "$SEISMIC_FREQ_MIN" \

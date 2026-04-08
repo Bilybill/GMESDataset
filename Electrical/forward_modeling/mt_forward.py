@@ -52,18 +52,16 @@ def generate_mt_frequencies(f_min: float, f_max: float) -> list[float]:
     """
     return _generate_phoenix_frequencies(float(f_min), float(f_max))
 
-
 def resolve_auto_mt_frequencies(rho_tensor: torch.Tensor, dz: float):
     bg_rho = _estimate_boundary_background_rho(rho_tensor)
     skin_depth_min = dz * 2.0
     total_depth = rho_tensor.shape[2] * dz
-    skin_depth_max = total_depth / 3.0
+    skin_depth_max = total_depth / 1
 
     f_max = bg_rho * (503.0 / skin_depth_min) ** 2
     f_min = bg_rho * (503.0 / skin_depth_max) ** 2
     freqs = _generate_phoenix_frequencies(f_min, f_max)
     return freqs, bg_rho, f_min, f_max
-
 
 class MTForward3D(nn.Module):
     def __init__(self, freqs=None, dx=1.0, dy=1.0, dz=1.0):
