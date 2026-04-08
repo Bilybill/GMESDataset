@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument("--device", dest="torch_device_preference", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--mt-freq-min", dest="mt_freq_min", type=float, default=None)
     parser.add_argument("--mt-freq-max", dest="mt_freq_max", type=float, default=None)
+    parser.add_argument("--seismic-freq-min", dest="seismic_freq_min", type=float, default=None)
+    parser.add_argument("--seismic-freq-max", dest="seismic_freq_max", type=float, default=None)
     parser.add_argument("--seismic-preset", dest="seismic_preset", type=str, default="light", choices=SEISMIC_PRESETS)
     parser.add_argument("--seismic-batch-size", dest="seismic_batch_size", type=int, default=0)
     return parser.parse_args()
@@ -140,6 +142,8 @@ def main():
                 seismic_batch_size=args.seismic_batch_size,
                 mt_freq_min=args.mt_freq_min,
                 mt_freq_max=args.mt_freq_max,
+                seismic_freq_min=args.seismic_freq_min,
+                seismic_freq_max=args.seismic_freq_max,
                 save_previews=args.save_previews,
             )
             record["qc"] = _load_forward_qc(bundle_path)

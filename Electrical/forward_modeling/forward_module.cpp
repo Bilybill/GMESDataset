@@ -143,7 +143,7 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mt_3d(torch::Tensor rho_tensor,
     if (freqs.empty()) {
         double skin_depth_min = dz * 2.0;
         double total_depth = NZ * dz;
-        double skin_depth_max = total_depth / 3.0;
+        double skin_depth_max = total_depth / 1.5;
         double f_max = bg_rho_for_bc * std::pow(503.0 / skin_depth_min, 2.0);
         double f_min = bg_rho_for_bc * std::pow(503.0 / skin_depth_max, 2.0);
 

@@ -216,7 +216,7 @@ int main(int argc, char *argv[]) {
     if (f_min <= 0.0 || f_max <= 0.0) {
         double skin_depth_min = dz * 2.0;                
         double total_depth = NZ * dz;
-        double skin_depth_max = total_depth / 3.0;         
+        double skin_depth_max = total_depth / 1.5;         
 
         f_max = bg_rho_for_bc * std::pow(503.0 / skin_depth_min, 2.0);
         f_min = bg_rho_for_bc * std::pow(503.0 / skin_depth_max, 2.0);

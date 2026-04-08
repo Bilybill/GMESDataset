@@ -1,6 +1,8 @@
 import argparse
+import hashlib
 import json
 import os
+import random
 import time
 import numpy as np
 import torch
@@ -139,7 +141,124 @@ def _save_mt_xz_slice(res_tensor, spacing, save_path, log_scale=True):
     print(f"[+] Saved MT resistivity X-Z slice to: {save_path}")
 
 
-def _build_seismic_3d_config(shape, spacing, preset="full"):
+def _stable_uint32_seed(*parts):
+    key = "|".join(str(part) for part in parts if part is not None)
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _resolve_seismic_frequency_spec(seismic_freq_min, seismic_freq_max, default_freq=10.0):
+    if seismic_freq_min is None and seismic_freq_max is None:
+        return float(default_freq)
+    if seismic_freq_min is None or seismic_freq_max is None:
+        raise ValueError(
+            "Please provide both seismic_freq_min and seismic_freq_max, or leave both unset "
+            "to use the default seismic source frequency."
+        )
+    seismic_freq_min = float(seismic_freq_min)
+    seismic_freq_max = float(seismic_freq_max)
+    if seismic_freq_min <= 0.0 or seismic_freq_max <= 0.0:
+        raise ValueError("Seismic frequency bounds must be positive.")
+    if seismic_freq_max < seismic_freq_min:
+        raise ValueError("Seismic frequency max must be >= min.")
+    return [seismic_freq_min, seismic_freq_max]
+
+
+def _compute_safe_seismic_frequency_max(model, spacing, pml_threshold=6.0):
+    vp = np.asarray(model.get("vp"), dtype=np.float32)
+    if vp.size == 0:
+        return None, None, None
+    positive = vp[np.isfinite(vp) & (vp > 0.0)]
+    if positive.size == 0:
+        return None, None, None
+    max_spacing = max(float(spacing[0]), float(spacing[1]), float(spacing[2]))
+    if max_spacing <= 0.0:
+        return None, None, None
+    vmin = float(positive.min())
+    safe_max_hz = vmin / (float(pml_threshold) * max_spacing)
+    return float(safe_max_hz), vmin, max_spacing
+
+
+def _pick_seismic_source_frequency(freq_spec, model, spacing, pml_threshold=6.0):
+    safe_max_hz, min_nonzero_vel, max_spacing = _compute_safe_seismic_frequency_max(
+        model,
+        spacing,
+        pml_threshold=pml_threshold,
+    )
+    dispersion_adjusted = False
+    if isinstance(freq_spec, (list, tuple, np.ndarray)):
+        freq_values = list(freq_spec)
+        if not freq_values:
+            raise ValueError("Empty seismic frequency specification.")
+        if len(freq_values) == 1:
+            freq_spec = float(freq_values[0])
+        else:
+            freq_min = float(freq_values[0])
+            freq_max = float(freq_values[1])
+            effective_max = freq_max
+            if safe_max_hz is not None and safe_max_hz < effective_max:
+                effective_max = max(safe_max_hz, 1e-6)
+                dispersion_adjusted = True
+            seed = _stable_uint32_seed(
+                "seismic_freq",
+                model.get("source_relpath", ""),
+                model.get("anomaly_type", ""),
+                model.get("anomaly_variant_index", 0),
+                model.get("anomaly_seed", 0),
+                f"{freq_min:.6f}",
+                f"{freq_max:.6f}",
+                f"{effective_max:.6f}",
+            )
+            rng = random.Random(seed)
+            if effective_max >= freq_min:
+                if freq_min.is_integer() and effective_max.is_integer():
+                    picked_freq = float(rng.randint(int(freq_min), int(effective_max)))
+                else:
+                    picked_freq = float(rng.uniform(freq_min, effective_max))
+            else:
+                picked_freq = float(effective_max)
+            cells_per_wavelength = None
+            if (
+                min_nonzero_vel is not None
+                and max_spacing is not None
+                and picked_freq > 0.0
+            ):
+                cells_per_wavelength = float(min_nonzero_vel / (picked_freq * max_spacing))
+            return (
+                picked_freq,
+                seed,
+                freq_min,
+                freq_max,
+                safe_max_hz,
+                min_nonzero_vel,
+                max_spacing,
+                cells_per_wavelength,
+                dispersion_adjusted,
+            )
+    picked_freq = float(freq_spec)
+    if safe_max_hz is not None and picked_freq > safe_max_hz:
+        picked_freq = float(max(safe_max_hz, 1e-6))
+        dispersion_adjusted = True
+    cells_per_wavelength = None
+    if (
+        min_nonzero_vel is not None
+        and max_spacing is not None
+        and picked_freq > 0.0
+    ):
+        cells_per_wavelength = float(min_nonzero_vel / (picked_freq * max_spacing))
+    return (
+        picked_freq,
+        None,
+        None,
+        None,
+        safe_max_hz,
+        min_nonzero_vel,
+        max_spacing,
+        cells_per_wavelength,
+        dispersion_adjusted,
+    )
+
+
+def _build_seismic_3d_config(shape, spacing, preset="full", source_freq=10.0):
     nx, ny, nz = shape
     dx, dy, dz = spacing
 
@@ -165,6 +284,7 @@ def _build_seismic_3d_config(shape, spacing, preset="full"):
         "simulation": {
             "mode": "3D",
             "accuracy": 4,
+            "pml_threshold": 6.0,
         },
         "acquisition": {
             "default_y": "center",
@@ -183,7 +303,7 @@ def _build_seismic_3d_config(shape, spacing, preset="full"):
         },
         "source": {
             "type": "ricker",
-            "freq": 10.0,
+            "freq": source_freq,
             "amplitude": 1.0,
             "n_sources_per_shot": 1,
             "layout": "grid_random",
@@ -473,7 +593,7 @@ def save_model_bundle(model, save_dir, gravity_algorithm="prism_exact", seismic_
     return bundle_path
 
 
-def run_forward_pipeline_from_model(save_dir, model, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None, save_previews=True):
+def run_forward_pipeline_from_model(save_dir, model, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None, seismic_freq_min=None, seismic_freq_max=None, save_previews=True):
     os.makedirs(save_dir, exist_ok=True)
     gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
     vp_multi = model["vp"]
@@ -655,7 +775,30 @@ def run_forward_pipeline_from_model(save_dir, model, run_gravity=True, run_magne
         if seismic_device.type == "cpu":
             print("  --> Seismic device switched to CPU; 3D simulation may be very slow.")
         vp_3d = _move_tensor(vp_tensor_cpu, seismic_device)
-        seismic_config = _build_seismic_3d_config((nx, ny, nz), (dx, dy, dz), preset=seismic_preset)
+        seismic_freq_spec = _resolve_seismic_frequency_spec(seismic_freq_min, seismic_freq_max)
+        seismic_config = _build_seismic_3d_config(
+            (nx, ny, nz),
+            (dx, dy, dz),
+            preset=seismic_preset,
+            source_freq=seismic_freq_spec,
+        )
+        (
+            picked_freq_hz,
+            freq_selection_seed,
+            freq_min_hz,
+            freq_max_hz,
+            safe_max_freq_hz,
+            min_nonzero_vel,
+            max_spacing,
+            cells_per_wavelength,
+            dispersion_adjusted,
+        ) = _pick_seismic_source_frequency(
+            seismic_config["source"]["freq"],
+            model,
+            (dx, dy, dz),
+            pml_threshold=float(seismic_config["simulation"].get("pml_threshold", 6.0)),
+        )
+        seismic_config["source"]["freq"] = picked_freq_hz
         source_locations, receiver_locations = setup_acquisition(seismic_config, seismic_device)
         wavelet = get_wavelet(seismic_config, seismic_device)
         dt = float(seismic_config["time"]["dt"])
@@ -671,6 +814,21 @@ def run_forward_pipeline_from_model(save_dir, model, run_gravity=True, run_magne
             f"receivers/shot={n_rec} "
             f"({seismic_config['receiver']['n_receivers_x']}x{seismic_config['receiver']['n_receivers_y']})"
         )
+        if freq_min_hz is None:
+            print(f"  --> Seismic source frequency: fixed {freq_hz:g} Hz")
+        else:
+            print(
+                f"  --> Seismic source frequency: random range [{freq_min_hz:g}, {freq_max_hz:g}] Hz "
+                f"-> picked {freq_hz:g} Hz"
+            )
+        if safe_max_freq_hz is not None:
+            print(
+                f"  --> Anti-dispersion limit: f <= {safe_max_freq_hz:.2f} Hz "
+                f"(vmin={min_nonzero_vel:.1f} m/s, max_spacing={max_spacing:g} m, "
+                f"cells/wavelength={cells_per_wavelength:.2f})"
+            )
+        if dispersion_adjusted:
+            print("  --> Seismic frequency was automatically reduced to avoid Deepwave dispersion warnings.")
         print(f"  --> Seismic batch size: {resolved_batch_size} shot(s)/batch")
         bundle["seismic_source_locations"] = _tensor_to_numpy(source_locations).astype(np.int16, copy=False)
         bundle["seismic_receiver_locations"] = _tensor_to_numpy(receiver_locations).astype(np.int16, copy=False)
@@ -678,6 +836,19 @@ def run_forward_pipeline_from_model(save_dir, model, run_gravity=True, run_magne
         bundle["seismic_dt"] = np.array(dt, dtype=np.float32)
         bundle["seismic_nt"] = np.array(nt, dtype=np.int32)
         bundle["seismic_freq_hz"] = np.array(freq_hz, dtype=np.float32)
+        if safe_max_freq_hz is not None:
+            bundle["seismic_freq_safe_max_hz"] = np.array(safe_max_freq_hz, dtype=np.float32)
+            bundle["seismic_min_nonzero_vel_mps"] = np.array(min_nonzero_vel, dtype=np.float32)
+            bundle["seismic_max_grid_spacing_m"] = np.array(max_spacing, dtype=np.float32)
+            bundle["seismic_cells_per_wavelength"] = np.array(cells_per_wavelength, dtype=np.float32)
+        bundle["seismic_freq_dispersion_adjusted"] = np.array(bool(dispersion_adjusted))
+        if freq_min_hz is not None and freq_max_hz is not None:
+            bundle["seismic_freq_min_hz"] = np.array(freq_min_hz, dtype=np.float32)
+            bundle["seismic_freq_max_hz"] = np.array(freq_max_hz, dtype=np.float32)
+            bundle["seismic_freq_selection_mode"] = np.array("random_range")
+            bundle["seismic_freq_selection_seed"] = np.array(int(freq_selection_seed), dtype=np.uint32)
+        else:
+            bundle["seismic_freq_selection_mode"] = np.array("fixed")
         bundle["seismic_mode"] = np.array("3D")
         bundle["seismic_batch_size"] = np.array(resolved_batch_size, dtype=np.int32)
 
@@ -734,7 +905,7 @@ def run_forward_pipeline_from_model(save_dir, model, run_gravity=True, run_magne
     return bundle_path
 
 
-def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None, save_previews=True, anomaly_random_config=None):
+def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=True, run_magnetic=True, run_electrical=True, run_seismic=True, gravity_anomaly_mode="background", gravity_bg_density=2.67, gravity_algorithm="prism_exact", torch_device_preference="auto", anomaly_type="igneous_swarm", seismic_preset="full", seismic_batch_size=0, mt_freq_min=None, mt_freq_max=None, seismic_freq_min=None, seismic_freq_max=None, save_previews=True, anomaly_random_config=None):
     print("====== 1. 模型生成 ======")
     gravity_bg_density = _normalize_density_value_for_pipeline(gravity_bg_density)
     model = generate_model(vp_segy_path, label_segy_path, anomaly_type=anomaly_type, anomaly_random_config=anomaly_random_config)
@@ -753,6 +924,8 @@ def run_forward_pipeline(save_dir, vp_segy_path, label_segy_path, run_gravity=Tr
         seismic_batch_size=seismic_batch_size,
         mt_freq_min=mt_freq_min,
         mt_freq_max=mt_freq_max,
+        seismic_freq_min=seismic_freq_min,
+        seismic_freq_max=seismic_freq_max,
         save_previews=save_previews,
     )
 
@@ -766,6 +939,8 @@ if __name__ == '__main__':
     parser.add_argument("--anomaly-type", dest="anomaly_type", type=str, default="igneous_swarm", choices=FORWARD_ANOMALY_TYPES, help="Anomaly to inject for forward modeling.")
     parser.add_argument("--mt-freq-min", dest="mt_freq_min", type=float, default=None, help="Minimum MT frequency in Hz. Must be used together with --mt-freq-max.")
     parser.add_argument("--mt-freq-max", dest="mt_freq_max", type=float, default=None, help="Maximum MT frequency in Hz. Must be used together with --mt-freq-min.")
+    parser.add_argument("--seismic-freq-min", dest="seismic_freq_min", type=float, default=None, help="Minimum seismic source dominant frequency in Hz. Must be used together with --seismic-freq-max.")
+    parser.add_argument("--seismic-freq-max", dest="seismic_freq_max", type=float, default=None, help="Maximum seismic source dominant frequency in Hz. Must be used together with --seismic-freq-min.")
     parser.add_argument("--seismic-preset", dest="seismic_preset", type=str, default="full", choices=SEISMIC_PRESETS, help="3D seismic acquisition size preset.")
     parser.add_argument("--seismic-batch-size", dest="seismic_batch_size", type=int, default=0, help="Number of shots per Deepwave batch. Use 0 to run all shots in one batch.")
     parser.add_argument("--anomaly_mode", dest="gravity_anomaly_mode", type=str, default="background", choices=["absolute", "background", "constant"], help="Forward mode for input density/susceptibility: absolute, background, or constant.")
@@ -792,5 +967,7 @@ if __name__ == '__main__':
         seismic_batch_size=args.seismic_batch_size,
         mt_freq_min=args.mt_freq_min,
         mt_freq_max=args.mt_freq_max,
+        seismic_freq_min=args.seismic_freq_min,
+        seismic_freq_max=args.seismic_freq_max,
         anomaly_random_config=anomaly_random_config,
     )
