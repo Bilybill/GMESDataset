@@ -6,6 +6,7 @@ import os
 import sys
 import time
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -35,14 +36,22 @@ from experiments.utils.splits import split_records_by_background
 
 
 def _resolve_device(device_arg: str) -> torch.device:
-    requested = str(device_arg).lower()
-    if requested == "cpu":
-        return torch.device("cpu")
-    if requested == "cuda":
+    requested = str(device_arg).strip().lower()
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        device = torch.device(requested)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"Invalid device '{device_arg}'. Use values such as auto, cpu, cuda, or cuda:1.") from exc
+    if device.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available.")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device index {device.index} is out of range. "
+                f"Visible CUDA device count: {torch.cuda.device_count()}."
+            )
+    return device
 
 
 def _seed_everything(seed: int):
@@ -60,7 +69,8 @@ def _move_tree_to_device(tree, device: torch.device):
 def _move_batch(batch: dict, device: torch.device):
     inputs = _move_tree_to_device(batch["inputs"], device)
     targets = _move_tree_to_device(batch["targets"], device)
-    return inputs, targets
+    raw_targets = _move_tree_to_device(batch["raw_targets"], device)
+    return inputs, targets, raw_targets
 
 
 def _compute_forward_loss(predictions, targets):
@@ -77,6 +87,62 @@ def _batch_size_from_inputs(inputs) -> int:
     return int(inputs.shape[0])
 
 
+def _rescale_prediction_tree(predictions, target_scales):
+    if target_scales is None:
+        return predictions
+    if isinstance(predictions, dict):
+        return {
+            key: _rescale_prediction_tree(
+                predictions[key],
+                target_scales.get(key) if isinstance(target_scales, dict) else None,
+            )
+            for key in predictions
+        }
+    if isinstance(target_scales, dict):
+        target_scales = target_scales.get("default")
+    scale = float(target_scales) if target_scales not in (None, 0.0) else 1.0
+    return predictions * scale
+
+
+def _compute_gravity_global_scale(records: list[dict]) -> float:
+    total_count = 0
+    total_sum = 0.0
+    total_sum_sq = 0.0
+    for record in records:
+        with np.load(record["bundle_path"], allow_pickle=True) as bundle:
+            gravity = np.asarray(bundle["gravity_data"], dtype=np.float64)
+        total_count += gravity.size
+        total_sum += float(gravity.sum())
+        total_sum_sq += float(np.square(gravity).sum())
+    if total_count == 0:
+        return 1.0
+    mean = total_sum / total_count
+    variance = max(total_sum_sq / total_count - mean * mean, 0.0)
+    scale = float(np.sqrt(variance))
+    return scale if scale > 1.0e-6 else 1.0
+
+
+def _build_target_scales(train_records: list[dict], task_name: str):
+    if task_name == "rho_to_gravity":
+        return {"default": _compute_gravity_global_scale(train_records)}
+    if task_name == "joint_multiphysics":
+        return {"gravity": _compute_gravity_global_scale(train_records)}
+    return None
+
+
+def _format_metric_block(metrics: dict) -> dict:
+    ordered = {}
+    for key in ("mae", "pearson_r", "nonzero_relative_l2", "relative_l2", "inference_time_ms", "loss"):
+        if key in metrics:
+            ordered[key] = metrics[key]
+    for key, value in metrics.items():
+        if key == "per_target":
+            continue
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def _filter_records_for_task(records: list[dict], task_name: str) -> list[dict]:
     spec = FORWARD_TASK_SPECS[task_name]
     if spec.required_status_key == "has_all_modalities":
@@ -84,13 +150,13 @@ def _filter_records_for_task(records: list[dict], task_name: str) -> list[dict]:
     return [record for record in records if record.get(spec.required_status_key) == "ok"]
 
 
-def run_epoch(model, loader, optimizer, device, training: bool):
+def run_epoch(model, loader, optimizer, device, training: bool, target_scales=None):
     model.train(training)
     loss_meter = AverageMeter()
     metrics_meter = None
 
     for batch in loader:
-        inputs, targets = _move_batch(batch, device)
+        inputs, targets, raw_targets = _move_batch(batch, device)
         start = time.perf_counter()
         with torch.set_grad_enabled(training):
             predictions = model(inputs)
@@ -101,7 +167,8 @@ def run_epoch(model, loader, optimizer, device, training: bool):
                 optimizer.step()
         batch_size = _batch_size_from_inputs(inputs)
         elapsed_ms = (time.perf_counter() - start) * 1000.0 / max(batch_size, 1)
-        batch_metrics = summarize_forward_metrics(predictions.detach(), targets.detach() if hasattr(targets, "detach") else targets)
+        raw_predictions = _rescale_prediction_tree(predictions.detach(), target_scales)
+        batch_metrics = summarize_forward_metrics(raw_predictions, raw_targets)
 
         if metrics_meter is None:
             target_names = sorted(batch_metrics.get("per_target", {})) if isinstance(batch_metrics, dict) else None
@@ -134,7 +201,12 @@ def parse_args():
     )
     parser.add_argument("--task", type=str, required=True, choices=sorted(FORWARD_TASK_SPECS))
     parser.add_argument("--model", type=str, required=True, choices=["unet", "pinn", "deeponet", "fno", "gnot"])
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Torch device string, e.g. auto, cpu, cuda, cuda:0, cuda:1.",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1.0e-3)
@@ -200,9 +272,10 @@ def main():
     if not heldout_records:
         raise RuntimeError("No held-out records were selected.")
 
-    train_dataset = GMESForwardDataset(train_records, task_name=args.task)
-    val_dataset = GMESForwardDataset(val_records, task_name=args.task)
-    heldout_dataset = GMESForwardDataset(heldout_records, task_name=args.task)
+    target_scales = _build_target_scales(train_records, args.task)
+    train_dataset = GMESForwardDataset(train_records, task_name=args.task, target_scales=target_scales)
+    val_dataset = GMESForwardDataset(val_records, task_name=args.task, target_scales=target_scales)
+    heldout_dataset = GMESForwardDataset(heldout_records, task_name=args.task, target_scales=target_scales)
 
     sample = train_dataset[0]
     in_channels = int(sample["inputs"].shape[0])
@@ -232,6 +305,8 @@ def main():
 
     history = []
     best_val = float("inf")
+    best_epoch = 0
+    best_epoch_record = None
     best_ckpt_path = os.path.join(output_dir, "best_model.pt")
     last_ckpt_path = os.path.join(output_dir, "last_model.pt")
 
@@ -243,13 +318,15 @@ def main():
     print(f"Held-out  : {len(heldout_dataset)}")
     print(f"Input     : {tuple(sample['inputs'].shape)}")
     print(f"Targets   : {json.dumps(output_specs, ensure_ascii=True)}")
+    if target_scales is not None:
+        print(f"TargetSc. : {json.dumps(target_scales, ensure_ascii=True)}")
     print(f"Output dir: {output_dir}")
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, optimizer, device, training=True)
+        train_metrics = run_epoch(model, train_loader, optimizer, device, training=True, target_scales=target_scales)
         with torch.no_grad():
-            val_metrics = run_epoch(model, val_loader, optimizer=None, device=device, training=False)
-            heldout_metrics = run_epoch(model, heldout_loader, optimizer=None, device=device, training=False)
+            val_metrics = run_epoch(model, val_loader, optimizer=None, device=device, training=False, target_scales=target_scales)
+            heldout_metrics = run_epoch(model, heldout_loader, optimizer=None, device=device, training=False, target_scales=target_scales)
 
         epoch_record = {
             "epoch": epoch,
@@ -262,7 +339,13 @@ def main():
             f"[epoch {epoch:03d}] "
             f"train_loss={train_metrics['loss']:.6f} "
             f"val_rl2={val_metrics['relative_l2']:.6f} "
-            f"heldout_rl2={heldout_metrics['relative_l2']:.6f}"
+            f"val_mae={val_metrics['mae']:.6f} "
+            f"val_r={val_metrics['pearson_r']:.6f} "
+            f"val_nonzero_rl2={val_metrics['nonzero_relative_l2']:.6f} "
+            f"heldout_rl2={heldout_metrics['relative_l2']:.6f} "
+            f"heldout_mae={heldout_metrics['mae']:.6f} "
+            f"heldout_r={heldout_metrics['pearson_r']:.6f} "
+            f"heldout_nonzero_rl2={heldout_metrics['nonzero_relative_l2']:.6f}"
         )
 
         state = {
@@ -274,21 +357,46 @@ def main():
                 "inputs": tuple(sample["inputs"].shape),
                 "targets": output_specs,
             },
+            "target_scales": target_scales,
         }
         torch.save(state, last_ckpt_path)
 
         if val_metrics["relative_l2"] < best_val:
             best_val = val_metrics["relative_l2"]
+            best_epoch = epoch
+            best_epoch_record = epoch_record
             torch.save(state, best_ckpt_path)
 
+    final_epoch_record = history[-1]
     results = {
         "task": args.task,
         "model": args.model,
         "device": str(device),
-        "train_size": len(train_dataset),
-        "val_size": len(val_dataset),
-        "heldout_size": len(heldout_dataset),
-        "best_val_relative_l2": best_val,
+        "splits": {
+            "train_size": len(train_dataset),
+            "val_size": len(val_dataset),
+            "heldout_size": len(heldout_dataset),
+        },
+        "sample_shapes": {
+            "inputs": tuple(sample["inputs"].shape),
+            "targets": output_specs,
+        },
+        "target_scales": target_scales,
+        "paths": {
+            "output_dir": output_dir,
+            "best_checkpoint": best_ckpt_path,
+            "last_checkpoint": last_ckpt_path,
+        },
+        "selection": {
+            "metric": "val.relative_l2",
+            "best_epoch": best_epoch,
+        },
+        "summary": {
+            "best_validation": _format_metric_block(best_epoch_record["val"]) if best_epoch_record is not None else {},
+            "heldout_at_best_validation": _format_metric_block(best_epoch_record["heldout"]) if best_epoch_record is not None else {},
+            "final_validation": _format_metric_block(final_epoch_record["val"]),
+            "final_heldout": _format_metric_block(final_epoch_record["heldout"]),
+        },
         "history": history,
     }
     metrics_path = os.path.join(output_dir, "metrics.json")

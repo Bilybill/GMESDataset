@@ -19,6 +19,7 @@ ensure_directory "${SUITE_LOG_DIR}"
 
 echo "[forward-suite] project_root=${PROJECT_ROOT}"
 echo "[forward-suite] config=${CONFIG_PATH}"
+echo "[forward-suite] device=${FORWARD_DEVICE}"
 echo "[forward-suite] logs=${SUITE_LOG_DIR}"
 
 for task in "${FORWARD_TASKS[@]}"; do

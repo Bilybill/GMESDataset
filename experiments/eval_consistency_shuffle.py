@@ -52,7 +52,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate modality-shuffled controls for GMES-3D classifiers.")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--root", type=str, default=default_root)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Torch device string, e.g. auto, cpu, cuda, cuda:0, cuda:1.",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.1)

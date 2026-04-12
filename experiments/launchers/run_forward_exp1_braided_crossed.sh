@@ -1,10 +1,52 @@
 #!/usr/bin/env bash
+#
+# Experiment 1 forward-modeling launcher.
+#
+# Purpose:
+#   Run the forward surrogate benchmark on the development subset formed by
+#   train-river/braided + train-river/crossed, while keeping tests-river as
+#   the held-out evaluation set.
+#
+# Default behavior:
+#   If EXP1_PHASE is not set, the script runs phase1:
+#     - rho_to_gravity
+#     - chi_to_magnetic
+#   with:
+#     - unet
+#     - fno
+#
+# Phase options:
+#   phase1 : rho_to_gravity + chi_to_magnetic
+#   phase2 : res_to_mt
+#   phase3 : vp_to_seismic
+#   phase4 : joint_multiphysics
+#   full   : all tasks above
+#
+# Common usage:
+#   bash experiments/launchers/run_forward_exp1_braided_crossed.sh
+#   DEVICE=cuda bash experiments/launchers/run_forward_exp1_braided_crossed.sh
+#   EXP1_PHASE=phase2 bash experiments/launchers/run_forward_exp1_braided_crossed.sh
+#   EXP1_PHASE=phase1 MODEL_FILTER=unet bash experiments/launchers/run_forward_exp1_braided_crossed.sh
+#   TASK_FILTER=joint_multiphysics MODEL_FILTER=fno bash experiments/launchers/run_forward_exp1_braided_crossed.sh
+#
+# Dry run:
+#   SKIP_CONDA_ACTIVATE=1 DRY_RUN=1 bash experiments/launchers/run_forward_exp1_braided_crossed.sh
+#
+# Results:
+#   Outputs are written under:
+#     /home/wangyh/Project/GMESUni/GMESDataset/DATAFOLDER/ExperimentRuns/forward_exp1_braided_crossed
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG_PATH="${PROJECT_ROOT}/experiments/configs/forward/exp1_braided_crossed.sh"
 EXP1_PHASE="${EXP1_PHASE:-phase1}"
+
+# Accept a short DEVICE alias for convenience.
+if [[ -n "${DEVICE:-}" && -z "${FORWARD_DEVICE:-}" ]]; then
+  export FORWARD_DEVICE="${DEVICE}"
+fi
 
 case "${EXP1_PHASE}" in
   phase1)
@@ -39,6 +81,7 @@ export MODEL_FILTER="${MODEL_FILTER:-${DEFAULT_MODEL_FILTER}}"
 echo "[exp1-forward] phase=${EXP1_PHASE}"
 echo "[exp1-forward] task_filter=${TASK_FILTER}"
 echo "[exp1-forward] model_filter=${MODEL_FILTER}"
+echo "[exp1-forward] device=${FORWARD_DEVICE:-cuda}"
 echo "[exp1-forward] config=${CONFIG_PATH}"
 echo "[exp1-forward] results_root=/home/wangyh/Project/GMESUni/GMESDataset/DATAFOLDER/ExperimentRuns/forward_exp1_braided_crossed"
 echo "[exp1-forward] per-run outputs: results_root/<task>_<model>/"

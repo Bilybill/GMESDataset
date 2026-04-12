@@ -19,7 +19,12 @@ from experiments.datasets.benchmark_index import (
 )
 from experiments.datasets.gmes_forward_dataset import GMESForwardDataset, infer_output_spec_from_sample
 from experiments.models.registry import build_forward_model
-from experiments.train_forward_surrogate import _filter_records_for_task, _resolve_device, run_epoch
+from experiments.train_forward_surrogate import (
+    _filter_records_for_task,
+    _format_metric_block,
+    _resolve_device,
+    run_epoch,
+)
 from experiments.utils.splits import split_records_by_background
 
 
@@ -36,7 +41,12 @@ def parse_args():
         nargs="*",
         default=list(DEFAULT_PARTITION_ALIASES),
     )
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Torch device string, e.g. auto, cpu, cuda, cuda:0, cuda:1.",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -63,6 +73,7 @@ def main():
     args = parse_args()
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     ckpt_args = checkpoint["args"]
+    target_scales = checkpoint.get("target_scales")
     device = _resolve_device(args.device)
     development_source_prefixes = (
         args.development_source_prefixes
@@ -93,7 +104,7 @@ def main():
         seed=args.seed,
     )
     eval_records = val_records if args.split == "val" else heldout_records
-    dataset = GMESForwardDataset(eval_records, task_name=ckpt_args["task"])
+    dataset = GMESForwardDataset(eval_records, task_name=ckpt_args["task"], target_scales=target_scales)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     sample = dataset[0]
@@ -115,9 +126,26 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"])
 
     with torch.no_grad():
-        metrics = run_epoch(model, loader, optimizer=None, device=device, training=False)
+        metrics = run_epoch(model, loader, optimizer=None, device=device, training=False, target_scales=target_scales)
 
-    print(json.dumps({"split": args.split, "metrics": metrics}, ensure_ascii=True, indent=2))
+    payload = {
+        "task": ckpt_args["task"],
+        "model": ckpt_args["model"],
+        "split": args.split,
+        "num_samples": len(dataset),
+        "device": str(device),
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "summary": _format_metric_block(metrics),
+    }
+    if "per_target" in metrics:
+        payload["per_target"] = {
+            name: _format_metric_block(per_target_metrics)
+            for name, per_target_metrics in metrics["per_target"].items()
+        }
+    if target_scales is not None:
+        payload["target_scales"] = target_scales
+
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
 
 
 if __name__ == "__main__":

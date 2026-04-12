@@ -27,14 +27,22 @@ from experiments.utils.splits import split_records_by_background
 
 
 def _resolve_device(device_arg: str) -> torch.device:
-    requested = str(device_arg).lower()
-    if requested == "cpu":
-        return torch.device("cpu")
-    if requested == "cuda":
+    requested = str(device_arg).strip().lower()
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        device = torch.device(requested)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"Invalid device '{device_arg}'. Use values such as auto, cpu, cuda, or cuda:1.") from exc
+    if device.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available.")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device index {device.index} is out of range. "
+                f"Visible CUDA device count: {torch.cuda.device_count()}."
+            )
+    return device
 
 
 def _seed_everything(seed: int):
@@ -121,7 +129,12 @@ def parse_args():
         required=True,
         help="Modalities to use: gravity magnetic mt seismic",
     )
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Torch device string, e.g. auto, cpu, cuda, cuda:0, cuda:1.",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1.0e-3)

@@ -132,6 +132,29 @@ def _to_tensor_tree(array_or_tree):
     return torch.from_numpy(array_or_tree)
 
 
+def _clone_array_tree(array_or_tree):
+    if isinstance(array_or_tree, dict):
+        return {key: _clone_array_tree(value) for key, value in array_or_tree.items()}
+    return array_or_tree.copy()
+
+
+def _apply_target_scales_numpy(targets, target_scales):
+    if target_scales is None:
+        return _clone_array_tree(targets)
+    if isinstance(targets, dict):
+        return {
+            key: _apply_target_scales_numpy(
+                targets[key],
+                target_scales.get(key) if isinstance(target_scales, dict) else None,
+            )
+            for key in targets
+        }
+    if isinstance(target_scales, dict):
+        target_scales = target_scales.get("default")
+    scale = float(target_scales) if target_scales not in (None, 0.0) else 1.0
+    return (targets / scale).astype(np.float32, copy=False)
+
+
 def infer_output_spec_from_sample(targets) -> dict[str, dict[str, tuple[int, ...] | int]]:
     if isinstance(targets, dict):
         return {
@@ -150,11 +173,12 @@ def infer_output_spec_from_sample(targets) -> dict[str, dict[str, tuple[int, ...
 
 
 class GMESForwardDataset(Dataset):
-    def __init__(self, records: list[dict], task_name: str):
+    def __init__(self, records: list[dict], task_name: str, target_scales=None):
         if task_name not in FORWARD_TASK_SPECS:
             raise ValueError(f"Unsupported forward task '{task_name}'. Available tasks: {sorted(FORWARD_TASK_SPECS)}")
         self.records = list(records)
         self.task = FORWARD_TASK_SPECS[task_name]
+        self.target_scales = target_scales
 
     def __len__(self) -> int:
         return len(self.records)
@@ -166,16 +190,18 @@ class GMESForwardDataset(Dataset):
         input_array = self.task.input_builder(bundle_dict).astype(np.float32, copy=False)
         target_array_or_tree = self.task.target_builder(bundle_dict)
         if isinstance(target_array_or_tree, dict):
-            targets = {
+            raw_targets = {
                 key: value.astype(np.float32, copy=False)
                 for key, value in target_array_or_tree.items()
             }
         else:
-            targets = target_array_or_tree.astype(np.float32, copy=False)
+            raw_targets = target_array_or_tree.astype(np.float32, copy=False)
+        targets = _apply_target_scales_numpy(raw_targets, self.target_scales)
 
         item = {
             "inputs": torch.from_numpy(input_array) if torch is not None else input_array,
             "targets": _to_tensor_tree(targets),
+            "raw_targets": _to_tensor_tree(raw_targets),
             "metadata": {
                 "bundle_path": record["bundle_path"],
                 "partition": record["partition"],

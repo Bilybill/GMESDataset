@@ -29,15 +29,27 @@ def mean_absolute_error(prediction, target):
     return (prediction - target).abs().mean(dim=tuple(range(1, prediction.ndim)))
 
 
+def nonzero_target_relative_l2(prediction, target, eps: float = 1.0e-8, target_norm_eps: float = 1.0e-8):
+    rl2 = relative_l2(prediction, target, eps=eps)
+    target_norm = target.pow(2).sum(dim=tuple(range(1, target.ndim))).sqrt()
+    mask = target_norm > target_norm_eps
+    if mask.any():
+        return rl2[mask].mean()
+    return rl2.new_tensor(float("nan"))
+
+
 def summarize_forward_metrics(prediction, target):
     if isinstance(prediction, dict):
         per_target = {
             name: summarize_forward_metrics(prediction[name], target[name])
             for name in sorted(prediction)
         }
-        keys = ("relative_l2", "pearson_r", "mae")
+        keys = ("relative_l2", "pearson_r", "mae", "nonzero_relative_l2")
         aggregate = {
-            key: float(sum(metrics[key] for metrics in per_target.values()) / max(len(per_target), 1))
+            key: float(
+                sum(metrics[key] for metrics in per_target.values() if not math.isnan(metrics[key]))
+                / max(sum(0 if math.isnan(metrics[key]) else 1 for metrics in per_target.values()), 1)
+            )
             for key in keys
         }
         return {
@@ -48,10 +60,12 @@ def summarize_forward_metrics(prediction, target):
     rl2 = relative_l2(prediction, target).mean().item()
     r = pearson_r(prediction, target).mean().item()
     mae = mean_absolute_error(prediction, target).mean().item()
+    nonzero_rl2 = nonzero_target_relative_l2(prediction, target).item()
     return {
         "relative_l2": float(rl2),
         "pearson_r": float(r),
         "mae": float(mae),
+        "nonzero_relative_l2": float(nonzero_rl2),
     }
 
 
@@ -76,6 +90,7 @@ def build_forward_metric_meters(target_names: list[str] | None = None) -> dict:
         "relative_l2": AverageMeter(),
         "pearson_r": AverageMeter(),
         "mae": AverageMeter(),
+        "nonzero_relative_l2": AverageMeter(),
         "inference_time_ms": AverageMeter(),
     }
     if not target_names:
@@ -85,6 +100,7 @@ def build_forward_metric_meters(target_names: list[str] | None = None) -> dict:
             "relative_l2": AverageMeter(),
             "pearson_r": AverageMeter(),
             "mae": AverageMeter(),
+            "nonzero_relative_l2": AverageMeter(),
         }
         for name in target_names
     }
@@ -92,13 +108,17 @@ def build_forward_metric_meters(target_names: list[str] | None = None) -> dict:
 
 
 def update_forward_metric_meters(metric_meters: dict, batch_metrics: dict, batch_size: int):
-    for key in ("relative_l2", "pearson_r", "mae"):
-        metric_meters[key].update(batch_metrics[key], batch_size)
+    for key in ("relative_l2", "pearson_r", "mae", "nonzero_relative_l2"):
+        value = batch_metrics[key]
+        if not math.isnan(value):
+            metric_meters[key].update(value, batch_size)
     if "per_target" not in metric_meters or "per_target" not in batch_metrics:
         return
     for target_name, per_target_metrics in batch_metrics["per_target"].items():
-        for key in ("relative_l2", "pearson_r", "mae"):
-            metric_meters["per_target"][target_name][key].update(per_target_metrics[key], batch_size)
+        for key in ("relative_l2", "pearson_r", "mae", "nonzero_relative_l2"):
+            value = per_target_metrics[key]
+            if not math.isnan(value):
+                metric_meters["per_target"][target_name][key].update(value, batch_size)
 
 
 def finalize_forward_metric_meters(metric_meters: dict) -> dict[str, float]:
@@ -106,13 +126,14 @@ def finalize_forward_metric_meters(metric_meters: dict) -> dict[str, float]:
         "relative_l2": metric_meters["relative_l2"].average,
         "pearson_r": metric_meters["pearson_r"].average,
         "mae": metric_meters["mae"].average,
+        "nonzero_relative_l2": metric_meters["nonzero_relative_l2"].average,
         "inference_time_ms": metric_meters["inference_time_ms"].average,
     }
     if "per_target" in metric_meters:
         result["per_target"] = {
             target_name: {
                 key: meters[key].average
-                for key in ("relative_l2", "pearson_r", "mae")
+                for key in ("relative_l2", "pearson_r", "mae", "nonzero_relative_l2")
             }
             for target_name, meters in metric_meters["per_target"].items()
         }

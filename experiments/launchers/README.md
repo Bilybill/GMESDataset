@@ -33,6 +33,12 @@ EXP1_PHASE=phase4 bash experiments/launchers/run_forward_exp1_braided_crossed.sh
 EXP1_PHASE=full bash experiments/launchers/run_forward_exp1_braided_crossed.sh
 ```
 
+Summarize Experiment 1 results after training:
+
+```bash
+bash experiments/launchers/summarize_forward_exp1_braided_crossed.sh
+```
+
 ## Classification suite
 
 Default run:
@@ -70,3 +76,18 @@ To use a custom config, pass its path as the first argument:
 bash experiments/launchers/run_forward_suite.sh /path/to/custom_forward_config.sh
 bash experiments/launchers/run_classification_suite.sh /path/to/custom_classification_config.sh
 ```
+
+## Result summary
+
+Forward result aggregation script:
+
+```bash
+python experiments/summarize_forward_results.py \
+  --root /home/wangyh/Project/GMESUni/GMESDataset/DATAFOLDER/ExperimentRuns/forward_exp1_braided_crossed
+```
+
+This writes:
+
+- `forward_results_summary.json`
+- `forward_results_summary.csv`
+- `forward_results_summary.md`
