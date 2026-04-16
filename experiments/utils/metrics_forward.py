@@ -15,6 +15,16 @@ def relative_l2(prediction, target, eps: float = 1.0e-8):
     return (numerator / denominator).sqrt()
 
 
+def masked_relative_l2(prediction, target, mask, eps: float = 1.0e-8):
+    mask = mask.to(dtype=prediction.dtype)
+    reduce_dims = tuple(range(1, prediction.ndim))
+    numerator = ((prediction - target).pow(2) * mask).sum(dim=reduce_dims)
+    denominator = (target.pow(2) * mask).sum(dim=reduce_dims).clamp_min(eps)
+    valid = mask.sum(dim=reduce_dims) > 0
+    values = (numerator / denominator).sqrt()
+    return torch.where(valid, values, torch.full_like(values, float("nan")))
+
+
 def pearson_r(prediction, target, eps: float = 1.0e-8):
     pred = prediction.flatten(start_dim=1)
     tgt = target.flatten(start_dim=1)
@@ -25,8 +35,39 @@ def pearson_r(prediction, target, eps: float = 1.0e-8):
     return numerator / denominator
 
 
+def masked_pearson_r(prediction, target, mask, eps: float = 1.0e-8):
+    pred = prediction.flatten(start_dim=1)
+    tgt = target.flatten(start_dim=1)
+    weights = mask.flatten(start_dim=1).to(dtype=prediction.dtype)
+    valid = weights.sum(dim=1)
+    safe_valid = valid.clamp_min(1.0)
+
+    pred_mean = (pred * weights).sum(dim=1, keepdim=True) / safe_valid.unsqueeze(1)
+    tgt_mean = (tgt * weights).sum(dim=1, keepdim=True) / safe_valid.unsqueeze(1)
+
+    pred_centered = (pred - pred_mean) * weights
+    tgt_centered = (tgt - tgt_mean) * weights
+    numerator = (pred_centered * tgt_centered).sum(dim=1)
+    denominator = (
+        pred_centered.pow(2).sum(dim=1).sqrt().clamp_min(eps)
+        * tgt_centered.pow(2).sum(dim=1).sqrt().clamp_min(eps)
+    )
+    values = numerator / denominator
+    return torch.where(valid > 1.0, values, torch.full_like(values, float("nan")))
+
+
 def mean_absolute_error(prediction, target):
     return (prediction - target).abs().mean(dim=tuple(range(1, prediction.ndim)))
+
+
+def masked_mean_absolute_error(prediction, target, mask):
+    mask = mask.to(dtype=prediction.dtype)
+    reduce_dims = tuple(range(1, prediction.ndim))
+    numerator = ((prediction - target).abs() * mask).sum(dim=reduce_dims)
+    denominator = mask.sum(dim=reduce_dims).clamp_min(1.0)
+    valid = mask.sum(dim=reduce_dims) > 0
+    values = numerator / denominator
+    return torch.where(valid, values, torch.full_like(values, float("nan")))
 
 
 def nonzero_target_relative_l2(prediction, target, eps: float = 1.0e-8, target_norm_eps: float = 1.0e-8):
@@ -38,10 +79,36 @@ def nonzero_target_relative_l2(prediction, target, eps: float = 1.0e-8, target_n
     return rl2.new_tensor(float("nan"))
 
 
-def summarize_forward_metrics(prediction, target):
+def masked_nonzero_target_relative_l2(
+    prediction,
+    target,
+    mask,
+    eps: float = 1.0e-8,
+    target_norm_eps: float = 1.0e-8,
+):
+    rl2 = masked_relative_l2(prediction, target, mask, eps=eps)
+    target_norm = (target.pow(2) * mask.to(dtype=target.dtype)).sum(dim=tuple(range(1, target.ndim))).sqrt()
+    valid = target_norm > target_norm_eps
+    if valid.any():
+        return rl2[valid].mean()
+    return rl2.new_tensor(float("nan"))
+
+
+def _nanmean(values):
+    valid = ~torch.isnan(values)
+    if valid.any():
+        return float(values[valid].mean().item())
+    return float("nan")
+
+
+def summarize_forward_metrics(prediction, target, mask=None):
     if isinstance(prediction, dict):
         per_target = {
-            name: summarize_forward_metrics(prediction[name], target[name])
+            name: summarize_forward_metrics(
+                prediction[name],
+                target[name],
+                mask.get(name) if isinstance(mask, dict) else None,
+            )
             for name in sorted(prediction)
         }
         keys = ("relative_l2", "pearson_r", "mae", "nonzero_relative_l2")
@@ -57,15 +124,21 @@ def summarize_forward_metrics(prediction, target):
             "per_target": per_target,
         }
 
-    rl2 = relative_l2(prediction, target).mean().item()
-    r = pearson_r(prediction, target).mean().item()
-    mae = mean_absolute_error(prediction, target).mean().item()
-    nonzero_rl2 = nonzero_target_relative_l2(prediction, target).item()
+    if mask is None:
+        rl2 = relative_l2(prediction, target)
+        r = pearson_r(prediction, target)
+        mae = mean_absolute_error(prediction, target)
+        nonzero_rl2 = nonzero_target_relative_l2(prediction, target)
+    else:
+        rl2 = masked_relative_l2(prediction, target, mask)
+        r = masked_pearson_r(prediction, target, mask)
+        mae = masked_mean_absolute_error(prediction, target, mask)
+        nonzero_rl2 = masked_nonzero_target_relative_l2(prediction, target, mask)
     return {
-        "relative_l2": float(rl2),
-        "pearson_r": float(r),
-        "mae": float(mae),
-        "nonzero_relative_l2": float(nonzero_rl2),
+        "relative_l2": _nanmean(rl2),
+        "pearson_r": _nanmean(r),
+        "mae": _nanmean(mae),
+        "nonzero_relative_l2": float(nonzero_rl2.item()),
     }
 
 

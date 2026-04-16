@@ -69,7 +69,7 @@ def _build_magnetic_target(bundle: dict) -> np.ndarray:
 
 
 def _build_mt_target(bundle: dict) -> np.ndarray:
-    return format_mt_target(bundle["mt_app_res"], bundle["mt_phase"])
+    return format_mt_target(bundle["mt_app_res"], bundle["mt_phase"], bundle.get("mt_freqs_hz"))
 
 
 def _build_seismic_target(bundle: dict) -> np.ndarray:
@@ -138,6 +138,12 @@ def _clone_array_tree(array_or_tree):
     return array_or_tree.copy()
 
 
+def _ones_mask_like(array_or_tree):
+    if isinstance(array_or_tree, dict):
+        return {key: _ones_mask_like(value) for key, value in array_or_tree.items()}
+    return np.ones_like(array_or_tree, dtype=np.float32)
+
+
 def _apply_target_scales_numpy(targets, target_scales):
     if target_scales is None:
         return _clone_array_tree(targets)
@@ -188,20 +194,54 @@ class GMESForwardDataset(Dataset):
         with np.load(record["bundle_path"], allow_pickle=True) as bundle:
             bundle_dict = {key: bundle[key] for key in bundle.files}
         input_array = self.task.input_builder(bundle_dict).astype(np.float32, copy=False)
-        target_array_or_tree = self.task.target_builder(bundle_dict)
-        if isinstance(target_array_or_tree, dict):
+        if self.task.name == "res_to_mt":
+            target_array, target_mask = format_mt_target(
+                bundle_dict["mt_app_res"],
+                bundle_dict["mt_phase"],
+                bundle_dict.get("mt_freqs_hz"),
+                return_mask=True,
+            )
+            raw_targets = target_array.astype(np.float32, copy=False)
+            target_masks = target_mask.astype(np.float32, copy=False)
+        elif self.task.name == "joint_multiphysics":
+            gravity = _build_gravity_target(bundle_dict).astype(np.float32, copy=False)
+            magnetic = _build_magnetic_target(bundle_dict).astype(np.float32, copy=False)
+            mt_target, mt_mask = format_mt_target(
+                bundle_dict["mt_app_res"],
+                bundle_dict["mt_phase"],
+                bundle_dict.get("mt_freqs_hz"),
+                return_mask=True,
+            )
+            seismic = _build_seismic_target(bundle_dict).astype(np.float32, copy=False)
             raw_targets = {
-                key: value.astype(np.float32, copy=False)
-                for key, value in target_array_or_tree.items()
+                "gravity": gravity,
+                "magnetic": magnetic,
+                "mt": mt_target.astype(np.float32, copy=False),
+                "seismic": seismic,
+            }
+            target_masks = {
+                "gravity": np.ones_like(gravity, dtype=np.float32),
+                "magnetic": np.ones_like(magnetic, dtype=np.float32),
+                "mt": mt_mask.astype(np.float32, copy=False),
+                "seismic": np.ones_like(seismic, dtype=np.float32),
             }
         else:
-            raw_targets = target_array_or_tree.astype(np.float32, copy=False)
+            target_array_or_tree = self.task.target_builder(bundle_dict)
+            if isinstance(target_array_or_tree, dict):
+                raw_targets = {
+                    key: value.astype(np.float32, copy=False)
+                    for key, value in target_array_or_tree.items()
+                }
+            else:
+                raw_targets = target_array_or_tree.astype(np.float32, copy=False)
+            target_masks = _ones_mask_like(raw_targets)
         targets = _apply_target_scales_numpy(raw_targets, self.target_scales)
 
         item = {
             "inputs": torch.from_numpy(input_array) if torch is not None else input_array,
             "targets": _to_tensor_tree(targets),
             "raw_targets": _to_tensor_tree(raw_targets),
+            "target_masks": _to_tensor_tree(target_masks),
             "metadata": {
                 "bundle_path": record["bundle_path"],
                 "partition": record["partition"],

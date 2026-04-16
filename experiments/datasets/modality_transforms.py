@@ -3,6 +3,29 @@ from __future__ import annotations
 import numpy as np
 
 
+MT_CANONICAL_FREQS_HZ = (
+    10000.0,
+    8000.0,
+    6000.0,
+    4000.0,
+    3000.0,
+    2000.0,
+    1500.0,
+    1000.0,
+    800.0,
+    600.0,
+    400.0,
+    300.0,
+    200.0,
+    150.0,
+    100.0,
+    80.0,
+    60.0,
+    40.0,
+    30.0,
+)
+
+
 def standardize_volume(volume: np.ndarray, eps: float = 1.0e-6) -> np.ndarray:
     volume = np.asarray(volume, dtype=np.float32)
     mean = float(volume.mean())
@@ -33,19 +56,103 @@ def format_planar_input(array_2d: np.ndarray) -> np.ndarray:
     return format_planar_target(standardize_map(array_2d))
 
 
-def format_mt_target(mt_app_res: np.ndarray, mt_phase: np.ndarray, app_res_eps: float = 1.0e-6) -> np.ndarray:
+def _align_mt_to_canonical_grid(
+    mt_app_res: np.ndarray,
+    mt_phase: np.ndarray,
+    mt_freqs_hz: np.ndarray,
+    canonical_freqs_hz: tuple[float, ...] = MT_CANONICAL_FREQS_HZ,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     app_res = np.asarray(mt_app_res, dtype=np.float32)
     phase = np.asarray(mt_phase, dtype=np.float32)
+    freqs = np.asarray(mt_freqs_hz, dtype=np.float32).reshape(-1)
+
     if app_res.shape != phase.shape:
         raise ValueError(f"MT apparent-resistivity shape {app_res.shape} does not match phase shape {phase.shape}.")
     if app_res.ndim != 4:
         raise ValueError(f"Expected MT tensors with shape (freq, x, y, pol), got {app_res.shape}.")
+    if app_res.shape[0] != freqs.shape[0]:
+        raise ValueError(
+            f"MT frequency count {freqs.shape[0]} does not match MT tensor shape {app_res.shape}."
+        )
+
+    canonical = np.asarray(canonical_freqs_hz, dtype=np.float32).reshape(-1)
+    index_by_freq = {round(float(freq), 6): idx for idx, freq in enumerate(canonical.tolist())}
+    observed_mask = np.zeros((canonical.shape[0], *phase.shape[1:]), dtype=np.float32)
+
+    for src_idx, freq in enumerate(freqs.tolist()):
+        key = round(float(freq), 6)
+        if key in index_by_freq:
+            observed_mask[index_by_freq[key]] = 1.0
+
+    sort_idx = np.argsort(freqs)
+    sorted_freqs = freqs[sort_idx].astype(np.float64, copy=False)
+    sorted_app_res = app_res[sort_idx].astype(np.float32, copy=False)
+    sorted_phase = phase[sort_idx].astype(np.float32, copy=False)
+
+    log_src = np.log10(np.clip(sorted_freqs, 1.0e-12, None))
+    log_dst = np.log10(np.clip(canonical.astype(np.float64, copy=False), 1.0e-12, None))
+
+    insert_idx = np.searchsorted(log_src, log_dst, side="left")
+    right_idx = np.clip(insert_idx, 0, len(log_src) - 1)
+    left_idx = np.clip(insert_idx - 1, 0, len(log_src) - 1)
+
+    left_log = log_src[left_idx]
+    right_log = log_src[right_idx]
+    denom = right_log - left_log
+    weights = np.zeros_like(log_dst, dtype=np.float32)
+    nonzero = np.abs(denom) > 1.0e-12
+    weights[nonzero] = ((log_dst[nonzero] - left_log[nonzero]) / denom[nonzero]).astype(np.float32, copy=False)
+
+    flat_app_res = sorted_app_res.reshape(sorted_app_res.shape[0], -1)
+    flat_phase = sorted_phase.reshape(sorted_phase.shape[0], -1)
+
+    aligned_app_res = (
+        (1.0 - weights)[:, None] * flat_app_res[left_idx] + weights[:, None] * flat_app_res[right_idx]
+    ).reshape(canonical.shape[0], *app_res.shape[1:]).astype(np.float32, copy=False)
+    aligned_phase = (
+        (1.0 - weights)[:, None] * flat_phase[left_idx] + weights[:, None] * flat_phase[right_idx]
+    ).reshape(canonical.shape[0], *phase.shape[1:]).astype(np.float32, copy=False)
+
+    return aligned_app_res, aligned_phase, observed_mask
+
+
+def format_mt_target(
+    mt_app_res: np.ndarray,
+    mt_phase: np.ndarray,
+    mt_freqs_hz: np.ndarray | None = None,
+    app_res_eps: float = 1.0e-6,
+    canonical_freqs_hz: tuple[float, ...] = MT_CANONICAL_FREQS_HZ,
+    return_mask: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    app_res = np.asarray(mt_app_res, dtype=np.float32)
+    phase = np.asarray(mt_phase, dtype=np.float32)
+
+    if mt_freqs_hz is not None:
+        app_res, phase, mask = _align_mt_to_canonical_grid(
+            app_res,
+            phase,
+            mt_freqs_hz,
+            canonical_freqs_hz=canonical_freqs_hz,
+        )
+    else:
+        if app_res.shape != phase.shape:
+            raise ValueError(f"MT apparent-resistivity shape {app_res.shape} does not match phase shape {phase.shape}.")
+        if app_res.ndim != 4:
+            raise ValueError(f"Expected MT tensors with shape (freq, x, y, pol), got {app_res.shape}.")
+        mask = np.ones_like(app_res, dtype=np.float32)
+
     app_res = np.log10(np.clip(app_res, app_res_eps, None))
     phase = phase / 180.0
     # (freq, x, y, pol) -> (channels, x, y)
     app_res = np.transpose(app_res, (0, 3, 1, 2)).reshape(-1, app_res.shape[1], app_res.shape[2])
     phase = np.transpose(phase, (0, 3, 1, 2)).reshape(-1, phase.shape[1], phase.shape[2])
-    return np.concatenate([app_res, phase], axis=0)
+    mask = np.transpose(mask, (0, 3, 1, 2)).reshape(-1, mask.shape[1], mask.shape[2])
+
+    target = np.concatenate([app_res, phase], axis=0)
+    target_mask = np.concatenate([mask, mask], axis=0)
+    if return_mask:
+        return target, target_mask
+    return target
 
 
 def format_seismic_target(

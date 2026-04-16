@@ -70,13 +70,26 @@ def _move_batch(batch: dict, device: torch.device):
     inputs = _move_tree_to_device(batch["inputs"], device)
     targets = _move_tree_to_device(batch["targets"], device)
     raw_targets = _move_tree_to_device(batch["raw_targets"], device)
-    return inputs, targets, raw_targets
+    target_masks = _move_tree_to_device(batch["target_masks"], device)
+    return inputs, targets, raw_targets, target_masks
 
 
-def _compute_forward_loss(predictions, targets):
+def _compute_forward_loss(predictions, targets, target_masks=None):
     if isinstance(predictions, dict):
-        losses = [torch.nn.functional.mse_loss(predictions[name], targets[name]) for name in sorted(predictions)]
+        losses = [
+            _compute_forward_loss(
+                predictions[name],
+                targets[name],
+                target_masks.get(name) if isinstance(target_masks, dict) else None,
+            )
+            for name in sorted(predictions)
+        ]
         return sum(losses) / max(len(losses), 1)
+    if target_masks is not None:
+        mask = target_masks.to(dtype=predictions.dtype)
+        squared_error = (predictions - targets).pow(2) * mask
+        normalizer = mask.sum().clamp_min(1.0)
+        return squared_error.sum() / normalizer
     return torch.nn.functional.mse_loss(predictions, targets)
 
 
@@ -104,16 +117,16 @@ def _rescale_prediction_tree(predictions, target_scales):
     return predictions * scale
 
 
-def _compute_gravity_global_scale(records: list[dict]) -> float:
+def _compute_bundle_array_global_scale(records: list[dict], bundle_key: str) -> float:
     total_count = 0
     total_sum = 0.0
     total_sum_sq = 0.0
     for record in records:
         with np.load(record["bundle_path"], allow_pickle=True) as bundle:
-            gravity = np.asarray(bundle["gravity_data"], dtype=np.float64)
-        total_count += gravity.size
-        total_sum += float(gravity.sum())
-        total_sum_sq += float(np.square(gravity).sum())
+            values = np.asarray(bundle[bundle_key], dtype=np.float64)
+        total_count += values.size
+        total_sum += float(values.sum())
+        total_sum_sq += float(np.square(values).sum())
     if total_count == 0:
         return 1.0
     mean = total_sum / total_count
@@ -124,9 +137,14 @@ def _compute_gravity_global_scale(records: list[dict]) -> float:
 
 def _build_target_scales(train_records: list[dict], task_name: str):
     if task_name == "rho_to_gravity":
-        return {"default": _compute_gravity_global_scale(train_records)}
+        return {"default": _compute_bundle_array_global_scale(train_records, "gravity_data")}
+    if task_name == "chi_to_magnetic":
+        return {"default": _compute_bundle_array_global_scale(train_records, "magnetic_data")}
     if task_name == "joint_multiphysics":
-        return {"gravity": _compute_gravity_global_scale(train_records)}
+        return {
+            "gravity": _compute_bundle_array_global_scale(train_records, "gravity_data"),
+            "magnetic": _compute_bundle_array_global_scale(train_records, "magnetic_data"),
+        }
     return None
 
 
@@ -156,11 +174,11 @@ def run_epoch(model, loader, optimizer, device, training: bool, target_scales=No
     metrics_meter = None
 
     for batch in loader:
-        inputs, targets, raw_targets = _move_batch(batch, device)
+        inputs, targets, raw_targets, target_masks = _move_batch(batch, device)
         start = time.perf_counter()
         with torch.set_grad_enabled(training):
             predictions = model(inputs)
-            loss = _compute_forward_loss(predictions, targets)
+            loss = _compute_forward_loss(predictions, targets, target_masks=target_masks)
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -168,7 +186,7 @@ def run_epoch(model, loader, optimizer, device, training: bool, target_scales=No
         batch_size = _batch_size_from_inputs(inputs)
         elapsed_ms = (time.perf_counter() - start) * 1000.0 / max(batch_size, 1)
         raw_predictions = _rescale_prediction_tree(predictions.detach(), target_scales)
-        batch_metrics = summarize_forward_metrics(raw_predictions, raw_targets)
+        batch_metrics = summarize_forward_metrics(raw_predictions, raw_targets, mask=target_masks)
 
         if metrics_meter is None:
             target_names = sorted(batch_metrics.get("per_target", {})) if isinstance(batch_metrics, dict) else None
