@@ -5,9 +5,11 @@ from pathlib import Path
 
 GPU_INDEX = "1"
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_INDEX
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 from mt_forward import MTForward3D, generate_mt_frequencies
 
@@ -95,6 +97,115 @@ def print_stats(name, arr):
     print(f"  nan count={np.isnan(arr).sum()}, inf count={np.isinf(arr).sum()}")
 
 
+def percentile_clim(values, lower=5.0, upper=95.0):
+    finite = np.asarray(values)[np.isfinite(values)]
+    if finite.size == 0:
+        return [0.0, 1.0]
+    vmin = float(np.percentile(finite, lower))
+    vmax = float(np.percentile(finite, upper))
+    if vmax <= vmin:
+        vmax = vmin + 1.0e-6
+    return [vmin, vmax]
+
+
+def plot_frequency_axis_debug(app_res, phase, freqs, res_model, output_dir):
+    plot_dir = Path(output_dir) / "frequency_axis_slices"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    log_app = np.log10(np.clip(app_res, 1.0e-6, None))
+    log_res = np.log10(np.clip(res_model, 1.0e-6, None))
+
+    app_clim = percentile_clim(log_app, lower=5.0, upper=95.0)
+    phase_clim = percentile_clim(phase, lower=5.0, upper=95.0)
+    res_clim = percentile_clim(log_res, lower=5.0, upper=95.0)
+
+    n_freq = int(app_res.shape[0])
+    nz = int(res_model.shape[2])
+
+    for ifreq, freq in enumerate(freqs):
+        if n_freq == 1:
+            z_idx = nz // 2
+        else:
+            z_idx = int(round(ifreq * (nz - 1) / (n_freq - 1)))
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
+
+        panels = [
+            (
+                axes[0, 0],
+                log_app[ifreq, :, :, 0].T,
+                "jet",
+                app_clim,
+                f"TE log10 apparent resistivity\nf={float(freq):.6g} Hz",
+                "log10(Ohm-m)",
+            ),
+            (
+                axes[0, 1],
+                log_app[ifreq, :, :, 1].T,
+                "jet",
+                app_clim,
+                f"TM log10 apparent resistivity\nf={float(freq):.6g} Hz",
+                "log10(Ohm-m)",
+            ),
+            (
+                axes[0, 2],
+                log_res[:, :, z_idx].T,
+                "jet",
+                res_clim,
+                f"Downsampled resistivity model\nZ slice={z_idx}",
+                "log10(Ohm-m)",
+            ),
+            (
+                axes[1, 0],
+                phase[ifreq, :, :, 0].T,
+                "jet",
+                phase_clim,
+                f"TE phase\nf={float(freq):.6g} Hz",
+                "degree",
+            ),
+            (
+                axes[1, 1],
+                phase[ifreq, :, :, 1].T,
+                "jet",
+                phase_clim,
+                f"TM phase\nf={float(freq):.6g} Hz",
+                "degree",
+            ),
+        ]
+
+        for ax, img, cmap, clim, title, cbar_label in panels:
+            im = ax.imshow(
+                img,
+                origin="lower",
+                cmap=cmap,
+                vmin=clim[0],
+                vmax=clim[1],
+                aspect="equal",
+            )
+            ax.set_title(title)
+            ax.set_xlabel("X index")
+            ax.set_ylabel("Y index")
+            fig.colorbar(im, ax=ax, shrink=0.82, label=cbar_label)
+
+        axes[1, 2].axis("off")
+        axes[1, 2].text(
+            0.02,
+            0.95,
+            "Frequency-axis debug\n"
+            f"freq index = {ifreq}/{n_freq - 1}\n"
+            f"freq = {float(freq):.6g} Hz\n"
+            f"mapped Z slice = {z_idx}/{nz - 1}",
+            ha="left",
+            va="top",
+            fontsize=12,
+        )
+
+        fig.savefig(plot_dir / f"freq_{ifreq:03d}_{float(freq):.6g}Hz.png", dpi=180)
+        plt.close(fig)
+
+    print(f"Saved frequency-axis debug plots: {plot_dir}")
+
+
 if __name__ == "__main__":
     args = parse_args()
     model_bundle = Path(args.model_bundle)
@@ -167,3 +278,11 @@ if __name__ == "__main__":
         source_model_bundle=np.array(str(model_bundle)),
     )
     print(f"Saved debug forward results: {output_npz}")
+
+    plot_frequency_axis_debug(
+        app_res_np,
+        phase_np,
+        freqs_np,
+        res_down_np,
+        output_dir,
+    )
