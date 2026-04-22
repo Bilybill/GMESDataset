@@ -33,6 +33,9 @@ EXP1_PHASE=phase4 bash experiments/launchers/run_forward_exp1_braided_crossed.sh
 EXP1_PHASE=full bash experiments/launchers/run_forward_exp1_braided_crossed.sh
 ```
 
+Here `phase3` runs the shot-conditioned seismic baseline
+`vp_source_to_seismic_shot` with the `shot_film` model.
+
 Summarize Experiment 1 results after training:
 
 ```bash

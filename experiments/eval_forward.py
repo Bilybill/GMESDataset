@@ -15,13 +15,14 @@ if PROJECT_ROOT not in sys.path:
 from experiments.datasets.benchmark_index import (
     DEFAULT_PARTITION_ALIASES,
     build_forward_index,
-    filter_records_by_source_prefixes,
 )
 from experiments.datasets.gmes_forward_dataset import GMESForwardDataset, infer_output_spec_from_sample
 from experiments.models.registry import build_forward_model
 from experiments.train_forward_surrogate import (
     _filter_records_for_task,
     _format_metric_block,
+    _infer_condition_dim,
+    _infer_in_channels,
     _resolve_device,
     run_epoch,
 )
@@ -91,9 +92,6 @@ def main():
         include_top_levels=args.include_top_levels,
         partition_aliases=DEFAULT_PARTITION_ALIASES,
         require_all_modalities=False,
-    )
-    records = filter_records_by_source_prefixes(
-        records,
         development_source_prefixes=development_source_prefixes,
         heldout_source_prefixes=heldout_source_prefixes,
     )
@@ -109,17 +107,20 @@ def main():
 
     sample = dataset[0]
     output_specs = infer_output_spec_from_sample(sample["targets"])
+    in_channels = _infer_in_channels(sample["inputs"])
+    condition_dim = _infer_condition_dim(sample["inputs"])
     if "default" in output_specs:
         model = build_forward_model(
             model_name=ckpt_args["model"],
-            in_channels=int(sample["inputs"].shape[0]),
+            in_channels=in_channels,
             out_channels=int(output_specs["default"]["out_channels"]),
             output_shape=tuple(output_specs["default"]["output_shape"]),
+            condition_dim=condition_dim,
         ).to(device)
     else:
         model = build_forward_model(
             model_name=ckpt_args["model"],
-            in_channels=int(sample["inputs"].shape[0]),
+            in_channels=in_channels,
             output_specs=output_specs,
         ).to(device)
 

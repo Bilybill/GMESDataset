@@ -4,10 +4,15 @@ import torch.nn as nn
 try:
     from . import mt_forward_cuda
 except ImportError:
-    raise ImportError(
-        "Failed to import mt_forward_cuda. Ensure the CUDA MT 3D extension is built and installed correctly. "
-        "Refer to the README for build instructions."
-    ) from None
+    try:
+        import mt_forward_cuda  # type: ignore[no-redef]
+    except ImportError:
+        raise ImportError(
+            "Failed to import mt_forward_cuda. "
+            "If you are running a local script from the forward_modeling directory, "
+            "make sure the built extension is present beside mt_forward.py. "
+            "If you are importing as a package, ensure the CUDA MT 3D extension is built and installed correctly."
+        ) from None
 
 
 PHOENIX_COEFFS = [8.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0]

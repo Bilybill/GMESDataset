@@ -158,20 +158,50 @@ def format_mt_target(
 def format_seismic_target(
     seismic_data: np.ndarray,
     shot_stride: int = 1,
-    receiver_stride: int = 16,
-    time_stride: int = 4,
+    receiver_stride: int = 4,
+    time_stride: int = 2,
     amplitude_clip_quantile: float | None = 0.995,
+    rms_eps: float = 1.0e-8,
 ) -> np.ndarray:
     seismic = np.asarray(seismic_data, dtype=np.float32)
     if seismic.ndim != 3:
         raise ValueError(f"Expected seismic data with shape (shot, receiver, time), got {seismic.shape}.")
 
     seismic = seismic[:: max(int(shot_stride), 1), :: max(int(receiver_stride), 1), :: max(int(time_stride), 1)]
+    rms = float(np.sqrt(np.mean(np.square(seismic, dtype=np.float64))))
+    if rms > float(rms_eps):
+        seismic = seismic / rms
     if amplitude_clip_quantile is not None:
         quantile = float(np.quantile(np.abs(seismic), amplitude_clip_quantile))
         if quantile > 0.0:
             seismic = np.clip(seismic, -quantile, quantile) / quantile
     return seismic
+
+
+def format_seismic_shot_target(
+    seismic_data: np.ndarray,
+    shot_index: int,
+    receiver_stride: int = 4,
+    time_stride: int = 2,
+    amplitude_clip_quantile: float | None = 0.995,
+    rms_eps: float = 1.0e-8,
+) -> np.ndarray:
+    seismic = np.asarray(seismic_data, dtype=np.float32)
+    if seismic.ndim != 3:
+        raise ValueError(f"Expected seismic data with shape (shot, receiver, time), got {seismic.shape}.")
+    shot_index = int(shot_index)
+    if shot_index < 0 or shot_index >= seismic.shape[0]:
+        raise IndexError(f"Shot index {shot_index} is out of range for seismic data with {seismic.shape[0]} shots.")
+
+    shot = seismic[shot_index : shot_index + 1, :: max(int(receiver_stride), 1), :: max(int(time_stride), 1)]
+    rms = float(np.sqrt(np.mean(np.square(shot, dtype=np.float64))))
+    if rms > float(rms_eps):
+        shot = shot / rms
+    if amplitude_clip_quantile is not None:
+        quantile = float(np.quantile(np.abs(shot), amplitude_clip_quantile))
+        if quantile > 0.0:
+            shot = np.clip(shot, -quantile, quantile) / quantile
+    return shot.astype(np.float32, copy=False)
 
 
 def downsample_binary_mask(mask: np.ndarray, output_shape: tuple[int, int, int] = (64, 64, 64)) -> np.ndarray:

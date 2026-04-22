@@ -1,8 +1,10 @@
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Iterable
+from zipfile import BadZipFile
 
 import numpy as np
 
@@ -90,8 +92,18 @@ def _matches_any_prefix(path: str, prefixes: Iterable[str] | None) -> bool:
     return False
 
 
-def _iter_forward_bundles(root: str, include_top_levels: set[str] | None = None) -> Iterable[tuple[str, str]]:
+def _iter_forward_bundles(
+    root: str,
+    include_top_levels: set[str] | None = None,
+    development_source_prefixes: Iterable[str] | None = None,
+    heldout_source_prefixes: Iterable[str] | None = None,
+    partition_aliases: dict[str, str] | None = None,
+) -> Iterable[tuple[str, str]]:
     root = os.path.abspath(root)
+    alias_map = dict(DEFAULT_PARTITION_ALIASES)
+    if partition_aliases:
+        alias_map.update(partition_aliases)
+
     for current_root, dirnames, filenames in os.walk(root):
         dirnames.sort()
         filenames.sort()
@@ -102,6 +114,12 @@ def _iter_forward_bundles(root: str, include_top_levels: set[str] | None = None)
         raw_partition = relpath.split(os.sep, 1)[0]
         if include_top_levels and raw_partition not in include_top_levels:
             continue
+        partition = alias_map.get(raw_partition, raw_partition)
+        bundle_dir_relpath = os.path.dirname(relpath)
+        if partition == "development" and not _matches_any_prefix(bundle_dir_relpath, development_source_prefixes):
+            continue
+        if partition == "heldout" and not _matches_any_prefix(bundle_dir_relpath, heldout_source_prefixes):
+            continue
         yield bundle_path, relpath
 
 
@@ -110,6 +128,8 @@ def build_forward_index(
     include_top_levels: Iterable[str] | None = None,
     partition_aliases: dict[str, str] | None = None,
     require_all_modalities: bool = True,
+    development_source_prefixes: Iterable[str] | None = None,
+    heldout_source_prefixes: Iterable[str] | None = None,
 ) -> list[dict]:
     alias_map = dict(DEFAULT_PARTITION_ALIASES)
     if partition_aliases:
@@ -118,11 +138,27 @@ def build_forward_index(
     top_levels = set(include_top_levels) if include_top_levels else None
     records: list[dict] = []
 
-    for bundle_path, bundle_relpath in _iter_forward_bundles(root, include_top_levels=top_levels):
+    for bundle_path, bundle_relpath in _iter_forward_bundles(
+        root,
+        include_top_levels=top_levels,
+        development_source_prefixes=development_source_prefixes,
+        heldout_source_prefixes=heldout_source_prefixes,
+        partition_aliases=alias_map,
+    ):
         raw_partition = bundle_relpath.split(os.sep, 1)[0]
         partition = alias_map.get(raw_partition, raw_partition)
 
-        with np.load(bundle_path, allow_pickle=True) as bundle:
+        try:
+            bundle_context = np.load(bundle_path, allow_pickle=True)
+        except (BadZipFile, EOFError, OSError, ValueError) as exc:
+            print(
+                f"[forward-index] warning: skipping unreadable bundle "
+                f"{bundle_relpath}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+        with bundle_context as bundle:
             gravity_status = str(_safe_item(bundle, "gravity_status", "missing"))
             magnetic_status = str(_safe_item(bundle, "magnetic_status", "missing"))
             mt_status = str(_safe_item(bundle, "mt_status", "missing"))
@@ -239,9 +275,6 @@ def main():
         include_top_levels=args.include_top_levels,
         partition_aliases=_parse_partition_aliases(args.partition_alias),
         require_all_modalities=not args.allow_missing_modalities,
-    )
-    records = filter_records_by_source_prefixes(
-        records,
         development_source_prefixes=args.development_source_prefixes,
         heldout_source_prefixes=args.heldout_source_prefixes,
     )

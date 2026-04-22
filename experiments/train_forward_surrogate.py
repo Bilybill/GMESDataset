@@ -17,14 +17,13 @@ if PROJECT_ROOT not in sys.path:
 from experiments.datasets.benchmark_index import (
     DEFAULT_PARTITION_ALIASES,
     build_forward_index,
-    filter_records_by_source_prefixes,
 )
 from experiments.datasets.gmes_forward_dataset import (
     FORWARD_TASK_SPECS,
     GMESForwardDataset,
     infer_output_spec_from_sample,
 )
-from experiments.models.registry import build_forward_model
+from experiments.models.registry import AVAILABLE_FORWARD_MODELS, build_forward_model
 from experiments.utils.metrics_forward import (
     AverageMeter,
     build_forward_metric_meters,
@@ -98,6 +97,31 @@ def _batch_size_from_inputs(inputs) -> int:
         first = next(iter(inputs.values()))
         return int(first.shape[0])
     return int(inputs.shape[0])
+
+
+def _shape_tree(value):
+    if isinstance(value, dict):
+        return {key: _shape_tree(child) for key, child in value.items()}
+    return tuple(value.shape)
+
+
+def _infer_in_channels(inputs) -> int:
+    if isinstance(inputs, dict):
+        volume = inputs["volume"]
+        if volume.ndim == 3:
+            return 1
+        if volume.ndim == 4:
+            return int(volume.shape[0])
+        if volume.ndim == 5:
+            return int(volume.shape[1])
+        raise ValueError(f"Cannot infer volume channels from shape {tuple(volume.shape)}.")
+    return int(inputs.shape[0])
+
+
+def _infer_condition_dim(inputs) -> int | None:
+    if isinstance(inputs, dict) and "condition" in inputs:
+        return int(inputs["condition"].shape[-1])
+    return None
 
 
 def _rescale_prediction_tree(predictions, target_scales):
@@ -218,7 +242,7 @@ def parse_args():
         help="Raw top-level directories to include in the forward benchmark index.",
     )
     parser.add_argument("--task", type=str, required=True, choices=sorted(FORWARD_TASK_SPECS))
-    parser.add_argument("--model", type=str, required=True, choices=["unet", "pinn", "deeponet", "fno", "gnot"])
+    parser.add_argument("--model", type=str, required=True, choices=list(AVAILABLE_FORWARD_MODELS))
     parser.add_argument(
         "--device",
         type=str,
@@ -263,9 +287,6 @@ def main():
         include_top_levels=args.include_top_levels,
         partition_aliases=DEFAULT_PARTITION_ALIASES,
         require_all_modalities=False,
-    )
-    records = filter_records_by_source_prefixes(
-        records,
         development_source_prefixes=args.development_source_prefixes,
         heldout_source_prefixes=args.heldout_source_prefixes,
     )
@@ -296,7 +317,8 @@ def main():
     heldout_dataset = GMESForwardDataset(heldout_records, task_name=args.task, target_scales=target_scales)
 
     sample = train_dataset[0]
-    in_channels = int(sample["inputs"].shape[0])
+    in_channels = _infer_in_channels(sample["inputs"])
+    condition_dim = _infer_condition_dim(sample["inputs"])
     output_specs = infer_output_spec_from_sample(sample["targets"])
     if "default" in output_specs:
         model = build_forward_model(
@@ -304,6 +326,7 @@ def main():
             in_channels=in_channels,
             out_channels=int(output_specs["default"]["out_channels"]),
             output_shape=tuple(output_specs["default"]["output_shape"]),
+            condition_dim=condition_dim,
         ).to(device)
     else:
         model = build_forward_model(
@@ -334,7 +357,7 @@ def main():
     print(f"Device    : {device}")
     print(f"Train/Val : {len(train_dataset)} / {len(val_dataset)}")
     print(f"Held-out  : {len(heldout_dataset)}")
-    print(f"Input     : {tuple(sample['inputs'].shape)}")
+    print(f"Input     : {json.dumps(_shape_tree(sample['inputs']), ensure_ascii=True)}")
     print(f"Targets   : {json.dumps(output_specs, ensure_ascii=True)}")
     if target_scales is not None:
         print(f"TargetSc. : {json.dumps(target_scales, ensure_ascii=True)}")
@@ -372,7 +395,7 @@ def main():
             "epoch": epoch,
             "history": history,
             "sample_shapes": {
-                "inputs": tuple(sample["inputs"].shape),
+                "inputs": _shape_tree(sample["inputs"]),
                 "targets": output_specs,
             },
             "target_scales": target_scales,
@@ -396,7 +419,7 @@ def main():
             "heldout_size": len(heldout_dataset),
         },
         "sample_shapes": {
-            "inputs": tuple(sample["inputs"].shape),
+            "inputs": _shape_tree(sample["inputs"]),
             "targets": output_specs,
         },
         "target_scales": target_scales,

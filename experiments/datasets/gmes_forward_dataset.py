@@ -48,6 +48,10 @@ def _build_vp_input(bundle: dict) -> np.ndarray:
     return standardize_volume(bundle["vp_model"])[None, ...]
 
 
+def _build_vp_volume_input(bundle: dict) -> np.ndarray:
+    return standardize_volume(bundle["vp_model"])
+
+
 def _build_joint_input(bundle: dict) -> np.ndarray:
     return np.stack(
         [
@@ -73,6 +77,41 @@ def _build_mt_target(bundle: dict) -> np.ndarray:
 
 
 def _build_seismic_target(bundle: dict) -> np.ndarray:
+    return format_seismic_target(bundle["seismic_data"])
+
+
+def _as_scalar(value, default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    array = np.asarray(value)
+    if array.shape == ():
+        return float(array.item())
+    if array.size == 0:
+        return float(default)
+    return float(array.reshape(-1)[0])
+
+
+def _build_source_frequency_conditions(bundle: dict) -> np.ndarray:
+    vp_shape = np.asarray(bundle["vp_model"]).shape
+    source_locations = np.asarray(bundle["seismic_source_locations"], dtype=np.float32)
+    sources = source_locations.reshape(source_locations.shape[0], -1, 3)[:, 0, :]
+    denominators = np.maximum(np.asarray(vp_shape[:3], dtype=np.float32) - 1.0, 1.0)
+    source_norm = sources / denominators[None, :]
+
+    freq_hz = max(_as_scalar(bundle.get("seismic_freq_hz"), default=0.0), 1.0e-6)
+    freq_norm = np.float32(np.log10(freq_hz) / np.log10(100.0))
+    freq_column = np.full((source_norm.shape[0], 1), freq_norm, dtype=np.float32)
+    return np.concatenate([source_norm.astype(np.float32, copy=False), freq_column], axis=1)
+
+
+def _build_vp_source_input(bundle: dict) -> dict[str, np.ndarray]:
+    return {
+        "volume": _build_vp_volume_input(bundle),
+        "condition": _build_source_frequency_conditions(bundle),
+    }
+
+
+def _build_seismic_shot_targets(bundle: dict) -> np.ndarray:
     return format_seismic_target(bundle["seismic_data"])
 
 
@@ -113,6 +152,13 @@ FORWARD_TASK_SPECS = {
         target_builder=_build_seismic_target,
         required_status_key="seismic_status",
         description="Predict shot-gather observations from the velocity volume.",
+    ),
+    "vp_source_to_seismic_shot": ForwardTaskSpec(
+        name="vp_source_to_seismic_shot",
+        input_builder=_build_vp_volume_input,
+        target_builder=_build_seismic_shot_targets,
+        required_status_key="seismic_status",
+        description="Predict specified seismic shot gathers from velocity, source locations, and source frequency.",
     ),
     "joint_multiphysics": ForwardTaskSpec(
         name="joint_multiphysics",
@@ -193,7 +239,10 @@ class GMESForwardDataset(Dataset):
         record = self.records[index]
         with np.load(record["bundle_path"], allow_pickle=True) as bundle:
             bundle_dict = {key: bundle[key] for key in bundle.files}
-        input_array = self.task.input_builder(bundle_dict).astype(np.float32, copy=False)
+        if self.task.name == "vp_source_to_seismic_shot":
+            input_array = _build_vp_source_input(bundle_dict)
+        else:
+            input_array = self.task.input_builder(bundle_dict).astype(np.float32, copy=False)
         if self.task.name == "res_to_mt":
             target_array, target_mask = format_mt_target(
                 bundle_dict["mt_app_res"],
@@ -225,6 +274,9 @@ class GMESForwardDataset(Dataset):
                 "mt": mt_mask.astype(np.float32, copy=False),
                 "seismic": np.ones_like(seismic, dtype=np.float32),
             }
+        elif self.task.name == "vp_source_to_seismic_shot":
+            raw_targets = _build_seismic_shot_targets(bundle_dict).astype(np.float32, copy=False)
+            target_masks = np.ones_like(raw_targets, dtype=np.float32)
         else:
             target_array_or_tree = self.task.target_builder(bundle_dict)
             if isinstance(target_array_or_tree, dict):
@@ -237,18 +289,23 @@ class GMESForwardDataset(Dataset):
             target_masks = _ones_mask_like(raw_targets)
         targets = _apply_target_scales_numpy(raw_targets, self.target_scales)
 
+        metadata = {
+            "bundle_path": record["bundle_path"],
+            "partition": record["partition"],
+            "background_id": record["background_id"],
+            "anomaly_type": record["anomaly_type"],
+            "task_name": self.task.name,
+        }
+        if self.task.name == "vp_source_to_seismic_shot":
+            metadata["num_shots"] = int(raw_targets.shape[0])
+            metadata["seismic_freq_hz"] = _as_scalar(bundle_dict.get("seismic_freq_hz"), default=0.0)
+
         item = {
-            "inputs": torch.from_numpy(input_array) if torch is not None else input_array,
+            "inputs": _to_tensor_tree(input_array),
             "targets": _to_tensor_tree(targets),
             "raw_targets": _to_tensor_tree(raw_targets),
             "target_masks": _to_tensor_tree(target_masks),
-            "metadata": {
-                "bundle_path": record["bundle_path"],
-                "partition": record["partition"],
-                "background_id": record["background_id"],
-                "anomaly_type": record["anomaly_type"],
-                "task_name": self.task.name,
-            },
+            "metadata": metadata,
         }
         return item
 
@@ -256,6 +313,8 @@ class GMESForwardDataset(Dataset):
 def infer_task_shapes(records: list[dict], task_name: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
     dataset = GMESForwardDataset(records[:1], task_name=task_name)
     sample = dataset[0]
+    if isinstance(sample["inputs"], dict):
+        raise ValueError("infer_task_shapes only supports tensor inputs. Inspect the dataset sample for conditioned tasks.")
     input_shape = tuple(sample["inputs"].shape)
     if isinstance(sample["targets"], dict):
         raise ValueError("infer_task_shapes only supports tensor targets. Use infer_output_spec_from_sample for joint tasks.")

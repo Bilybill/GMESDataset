@@ -12,6 +12,7 @@ DEFAULT_TASK_ORDER = [
     "chi_to_magnetic",
     "res_to_mt",
     "vp_to_seismic",
+    "vp_source_to_seismic_shot",
     "joint_multiphysics",
 ]
 
@@ -21,6 +22,7 @@ DEFAULT_MODEL_ORDER = [
     "deeponet",
     "fno",
     "gnot",
+    "shot_film",
 ]
 
 

@@ -18,6 +18,7 @@ FORWARD_MODELS=(
   "deeponet"
   "fno"
   "gnot"
+  "shot_film"
 )
 
 FORWARD_TASKS=(
@@ -25,7 +26,17 @@ FORWARD_TASKS=(
   "chi_to_magnetic"
   "res_to_mt"
   "vp_to_seismic"
+  "vp_source_to_seismic_shot"
   "joint_multiphysics"
+)
+
+declare -A FORWARD_TASK_MODELS=(
+  ["rho_to_gravity"]="unet pinn deeponet fno gnot"
+  ["chi_to_magnetic"]="unet pinn deeponet fno gnot"
+  ["res_to_mt"]="unet pinn deeponet fno gnot"
+  ["vp_to_seismic"]="unet pinn deeponet fno gnot"
+  ["vp_source_to_seismic_shot"]="shot_film"
+  ["joint_multiphysics"]="unet pinn deeponet fno gnot"
 )
 
 declare -A FORWARD_BATCH_SIZE=(
@@ -33,6 +44,7 @@ declare -A FORWARD_BATCH_SIZE=(
   ["chi_to_magnetic"]="1"
   ["res_to_mt"]="1"
   ["vp_to_seismic"]="1"
+  ["vp_source_to_seismic_shot"]="1"
   ["joint_multiphysics"]="1"
 )
 
@@ -41,6 +53,7 @@ declare -A FORWARD_EPOCHS=(
   ["chi_to_magnetic"]="30"
   ["res_to_mt"]="30"
   ["vp_to_seismic"]="30"
+  ["vp_source_to_seismic_shot"]="30"
   ["joint_multiphysics"]="30"
 )
 
@@ -49,6 +62,7 @@ declare -A FORWARD_LR=(
   ["chi_to_magnetic"]="1e-3"
   ["res_to_mt"]="1e-3"
   ["vp_to_seismic"]="1e-3"
+  ["vp_source_to_seismic_shot"]="1e-3"
   ["joint_multiphysics"]="5e-4"
 )
 

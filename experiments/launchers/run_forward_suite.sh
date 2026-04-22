@@ -31,7 +31,15 @@ for task in "${FORWARD_TASKS[@]}"; do
   epochs="${FORWARD_EPOCHS[$task]}"
   lr="${FORWARD_LR[$task]}"
 
-  for model in "${FORWARD_MODELS[@]}"; do
+  models_for_task=("${FORWARD_MODELS[@]}")
+  if declare -p FORWARD_TASK_MODELS >/dev/null 2>&1; then
+    task_specific_models="${FORWARD_TASK_MODELS[$task]:-}"
+    if [[ -n "${task_specific_models}" ]]; then
+      read -r -a models_for_task <<< "${task_specific_models}"
+    fi
+  fi
+
+  for model in "${models_for_task[@]}"; do
     if ! matches_optional_filter "${model}" "${MODEL_FILTER:-}"; then
       continue
     fi
