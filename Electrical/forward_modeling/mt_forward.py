@@ -1,18 +1,85 @@
+import ctypes
+import os
+import sys
+from pathlib import Path
+
+
+def _preload_conda_cxx_runtime():
+    """Prefer the active conda C++ runtime before torch loads system libstdc++."""
+    prefixes = []
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        prefixes.append(Path(conda_prefix))
+
+    python_exe = Path(sys.executable).resolve()
+    if python_exe.parent.name == "bin":
+        prefixes.append(python_exe.parent.parent)
+
+    seen = set()
+    for prefix in prefixes:
+        if prefix in seen:
+            continue
+        seen.add(prefix)
+        lib_dir = prefix / "lib"
+        loaded_any = False
+        for lib_name in ("libstdc++.so.6", "libgcc_s.so.1"):
+            lib_path = lib_dir / lib_name
+            if not lib_path.exists():
+                continue
+            try:
+                ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+                loaded_any = True
+            except OSError:
+                pass
+        if loaded_any:
+            return
+
+
+_preload_conda_cxx_runtime()
+
 import torch
 import torch.nn as nn
+import importlib
 
-try:
-    from . import mt_forward_cuda
-except ImportError:
-    try:
-        import mt_forward_cuda  # type: ignore[no-redef]
-    except ImportError:
-        raise ImportError(
-            "Failed to import mt_forward_cuda. "
-            "If you are running a local script from the forward_modeling directory, "
-            "make sure the built extension is present beside mt_forward.py. "
-            "If you are importing as a package, ensure the CUDA MT 3D extension is built and installed correctly."
-        ) from None
+
+def _load_backend():
+    errors = []
+    module_candidates = [
+        (".mt_forward_mfem", __package__),
+        ("mt_forward_mfem", None),
+        (".legacy_cuda.mt_forward_cuda", __package__),
+    ]
+
+    for module_name, package in module_candidates:
+        if module_name.startswith(".") and not package:
+            continue
+        try:
+            return importlib.import_module(module_name, package=package), None
+        except ImportError as exc:
+            errors.append(f"{module_name}: {exc}")
+
+    legacy_dir = Path(__file__).resolve().parent / "legacy_cuda"
+    if legacy_dir.exists():
+        sys.path.insert(0, str(legacy_dir))
+        try:
+            return importlib.import_module("mt_forward_cuda"), None
+        except ImportError as exc:
+            errors.append(f"legacy_cuda/mt_forward_cuda: {exc}")
+        finally:
+            try:
+                sys.path.remove(str(legacy_dir))
+            except ValueError:
+                pass
+
+    message = (
+        "Failed to import an MT forward backend. Build the MFEM backend "
+        "`mt_forward_mfem`, or keep the legacy CUDA extension available under "
+        "`legacy_cuda/`. Import attempts:\n- " + "\n- ".join(errors)
+    )
+    return None, ImportError(message)
+
+
+mt_backend, _BACKEND_IMPORT_ERROR = _load_backend()
 
 
 PHOENIX_COEFFS = [8.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0]
@@ -57,21 +124,44 @@ def generate_mt_frequencies(f_min: float, f_max: float) -> list[float]:
     """
     return _generate_phoenix_frequencies(float(f_min), float(f_max))
 
+
 def resolve_auto_mt_frequencies(rho_tensor: torch.Tensor, dz: float):
     bg_rho = _estimate_boundary_background_rho(rho_tensor)
     skin_depth_min = dz * 2.0
     total_depth = rho_tensor.shape[2] * dz
-    skin_depth_max = total_depth / 1
+    skin_depth_max = total_depth / 1.5
 
     f_max = bg_rho * (503.0 / skin_depth_min) ** 2
     f_min = bg_rho * (503.0 / skin_depth_max) ** 2
     freqs = _generate_phoenix_frequencies(f_min, f_max)
     return freqs, bg_rho, f_min, f_max
 
+
+def _sort_frequencies_desc(freqs) -> list[float]:
+    return sorted((float(freq) for freq in freqs), reverse=True)
+
+
+def _backend_is_mfem(backend) -> bool:
+    return backend is not None and backend.__name__.split(".")[-1] == "mt_forward_mfem"
+
+
+def mfem_cuda_enabled() -> bool:
+    """Return whether the loaded MFEM backend was compiled with CUDA support."""
+    return bool(
+        _backend_is_mfem(mt_backend)
+        and hasattr(mt_backend, "is_cuda_enabled")
+        and mt_backend.is_cuda_enabled()
+    )
+
+
+def _default_mfem_device() -> str:
+    return os.environ.get("GMES_MT_MFEM_DEVICE", "cpu")
+
+
 class MTForward3D(nn.Module):
-    def __init__(self, freqs=None, dx=1.0, dy=1.0, dz=1.0):
+    def __init__(self, freqs=None, dx=1.0, dy=1.0, dz=1.0, device=None):
         """
-        PyTorch wrapper for CUDA MT 3D Forward Modeling.
+        PyTorch wrapper for MFEM/CUDA MT 3D Forward Modeling.
         Args:
             freqs: Optional list of frequencies (Hz). If omitted or empty,
                 the frequency range is auto-generated from the model extent and
@@ -79,6 +169,8 @@ class MTForward3D(nn.Module):
             dx: Cell width in x-direction (m)
             dy: Cell width in y-direction (m)
             dz: Cell width in z-direction (m)
+            device: MFEM device string, e.g. "cpu" or "cuda". If omitted,
+                GMES_MT_MFEM_DEVICE is used when set, otherwise "cpu".
         """
         super(MTForward3D, self).__init__()
         self.freqs = None if freqs is None else list(freqs)
@@ -86,6 +178,7 @@ class MTForward3D(nn.Module):
         self.dx = dx
         self.dy = dy
         self.dz = dz
+        self.device = _default_mfem_device() if device is None else str(device)
 
     def forward(self, rho_tensor):
         """
@@ -100,26 +193,42 @@ class MTForward3D(nn.Module):
                 where the last dimension is (Zxy, Zyx). Returned on the same
                 device as `rho_tensor`.
         """
+        if mt_backend is None:
+            raise _BACKEND_IMPORT_ERROR
+
         input_device = rho_tensor.device
         rho_prepared = rho_tensor.detach().to(torch.float64)
-        # The original MTForward3D entry path is stable when the extension receives
-        # a CPU tensor and performs its own host/device staging internally. The
-        # newer CUDA-input branch is still less stable in large pipeline calls, so
-        # we keep the public API device-agnostic but normalize the extension input
-        # back to the known-good CPU entry path here.
         rho_solver_input = rho_prepared.cpu().contiguous()
         if self.freqs:
-            freqs = list(self.freqs)
+            freqs = _sort_frequencies_desc(self.freqs)
         else:
             freqs, _, _, _ = resolve_auto_mt_frequencies(rho_solver_input, self.dz)
+            freqs = _sort_frequencies_desc(freqs)
 
         self.last_freqs = tuple(freqs)
-        app_res, phase = mt_forward_cuda.compute_mt_3d(rho_solver_input, self.dx, self.dy, self.dz, freqs)
+
+        if _backend_is_mfem(mt_backend):
+            app_res_raw, phase_raw = mt_backend.compute_mt_3d(
+                rho_solver_input.numpy(),
+                self.dx,
+                self.dy,
+                self.dz,
+                freqs,
+                device=self.device,
+            )
+            app_res = torch.as_tensor(app_res_raw, dtype=torch.float64)
+            phase = torch.as_tensor(phase_raw, dtype=torch.float64)
+        else:
+            app_res_raw, phase_raw = mt_backend.compute_mt_3d(
+                rho_solver_input, self.dx, self.dy, self.dz, freqs
+            )
+            app_res = torch.as_tensor(app_res_raw, dtype=torch.float64)
+            phase = torch.as_tensor(phase_raw, dtype=torch.float64)
+
         if input_device.type != "cpu":
             app_res = app_res.to(input_device)
             phase = phase.to(input_device)
-        # The custom CUDA extension does not surface all launch errors immediately.
-        # Synchronize here so failures are attributed to MT instead of a later torch call.
-        if torch.cuda.is_available():
+
+        if not _backend_is_mfem(mt_backend) and torch.cuda.is_available():
             torch.cuda.synchronize()
         return app_res, phase
