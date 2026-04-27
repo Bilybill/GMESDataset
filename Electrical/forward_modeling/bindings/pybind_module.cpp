@@ -26,6 +26,7 @@ MTInput MakeInput(py::array_t<double, py::array::c_style | py::array::forcecast>
                   int npad_xy,
                   int npad_z,
                   double alpha,
+                  bool use_partial_assembly,
                   double rel_tol,
                   int max_iter,
                   bool verbose,
@@ -59,6 +60,7 @@ MTInput MakeInput(py::array_t<double, py::array::c_style | py::array::forcecast>
     input.padding.alpha = alpha;
     input.padding.enabled = npad_xy > 0 || npad_z > 0;
 
+    input.solver.use_partial_assembly = use_partial_assembly;
     input.solver.rel_tol = rel_tol;
     input.solver.max_iter = max_iter;
     input.solver.verbose = verbose;
@@ -84,6 +86,17 @@ PYBIND11_MODULE(mt_forward_mfem, m)
           },
           "Return true when the linked MFEM library was built with CUDA.");
 
+    m.def("is_ceed_enabled",
+          []()
+          {
+#ifdef MFEM_USE_CEED
+              return true;
+#else
+              return false;
+#endif
+          },
+          "Return true when the linked MFEM library was built with libCEED.");
+
     m.def("compute_mt_3d",
           [](py::array_t<double, py::array::c_style | py::array::forcecast> rho,
              double dx,
@@ -93,13 +106,15 @@ PYBIND11_MODULE(mt_forward_mfem, m)
              int npad_xy,
              int npad_z,
              double alpha,
+             bool use_partial_assembly,
              double rel_tol,
              int max_iter,
              bool verbose,
              const std::string& device)
           {
               MTInput input = MakeInput(rho, dx, dy, dz, std::move(freqs_hz),
-                                        npad_xy, npad_z, alpha, rel_tol,
+                                        npad_xy, npad_z, alpha,
+                                        use_partial_assembly, rel_tol,
                                         max_iter, verbose, device);
               MTResponse output = ComputeMT3D(input);
 
@@ -125,6 +140,7 @@ PYBIND11_MODULE(mt_forward_mfem, m)
           py::arg("npad_xy") = 10,
           py::arg("npad_z") = 10,
           py::arg("alpha") = 1.4,
+          py::arg("use_partial_assembly") = false,
           py::arg("rel_tol") = 1e-6,
           py::arg("max_iter") = 2000,
           py::arg("verbose") = false,

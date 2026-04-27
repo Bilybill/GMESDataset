@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "--freq-min",
         type=float,
-        default=0.001,
+        default=0.01,
         help="Minimum MT frequency in Hz.",
     )
     parser.add_argument(
@@ -71,6 +71,11 @@ def parse_args():
         type=str,
         default=os.environ.get("GMES_MT_MFEM_DEVICE", "cpu"),
         help='MFEM device string, for example "cpu" or "cuda".',
+    )
+    parser.add_argument(
+        "--partial-assembly",
+        action="store_true",
+        help="Enable MFEM partial assembly / matrix-free preconditioning path.",
     )
     return parser.parse_args()
 
@@ -260,7 +265,15 @@ if __name__ == "__main__":
 
     rho_tensor = res_down.to(torch.float64).contiguous()
     print(f"MFEM device request: {args.mfem_device}")
-    operator = MTForward3D(freqs, mt_dx, mt_dy, mt_dz, device=args.mfem_device)
+    print(f"Use partial assembly: {args.partial_assembly}")
+    operator = MTForward3D(
+        freqs,
+        mt_dx,
+        mt_dy,
+        mt_dz,
+        device=args.mfem_device,
+        use_partial_assembly=args.partial_assembly,
+    )
 
     start = time.time()
     app_res, phase = operator(rho_tensor)

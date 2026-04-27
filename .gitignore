@@ -13,3 +13,4 @@ build
 dist
 outputs
 DATAFOLDER/Cache
+Electrical/forward_modeling/.local/

@@ -14,13 +14,24 @@
 ## Current Execution Slice
 
 Goal:
-Create the MFEM-backed structure and compatibility layer while keeping the public Python API stable.
+Install a CUDA-enabled local MFEM stack under `forward_modeling/.local/`, rebuild
+`mt_forward_mfem` against it, and expose the partial-assembly / `ceed-cuda`
+execution path without changing the public Python API.
 
 Context:
-The legacy CUDA implementation is kept under `legacy_cuda/` for reference and fallback. The first MFEM implementation uses assembled operators and the scaled form `Kcurl + i * omega * mu0 * sigma * M`.
+The legacy CUDA implementation remains under `legacy_cuda/` for reference and
+fallback. The first MFEM implementation already uses the scaled form
+`Kcurl + i * omega * mu0 * sigma * M`; the new execution slice extends it with
+device-aware runtime selection, CUDA-enabled external dependencies, and a
+matrix-free path for CEED-backed execution.
 
 Constraints:
-Do not add new CUDA kernels. Keep partial assembly behind configuration only. Do not make `mt_forward.py` require a built backend at import time.
+Do not add new custom CUDA kernels. Keep partial assembly behind an explicit
+flag. Keep `mt_forward.py` importable when no backend is present. Preserve the
+existing return shapes and frequency ordering.
 
 Done when:
-The new directory tree exists, the CMake configuration is defined, the Python facade prefers `mt_forward_mfem`, and local tests that do not require MFEM pass.
+CUDA-enabled hypre/libCEED/MFEM install under `.local/`, `mt_forward_mfem`
+rebuilds against that install, Python can request `device="cuda"` or
+`device="ceed-cuda:/gpu/cuda/shared"` with `use_partial_assembly=True`, and the
+assembled CPU path remains available for regression comparison.

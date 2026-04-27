@@ -35,7 +35,25 @@ def _preload_conda_cxx_runtime():
             return
 
 
+def _preload_local_mfem_stack():
+    """Preload locally installed MFEM stack libraries when present."""
+    root = Path(__file__).resolve().parent
+    candidates = [
+        root / ".local" / "libCEED-cuda" / "lib" / "libceed.so",
+        root / ".local" / "hypre-cuda" / "lib" / "libHYPRE.so",
+        root / ".local" / "mfem-cuda" / "lib" / "libmfem.so",
+    ]
+    for lib_path in candidates:
+        if not lib_path.exists():
+            continue
+        try:
+            ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+
+
 _preload_conda_cxx_runtime()
+_preload_local_mfem_stack()
 
 import torch
 import torch.nn as nn
@@ -154,12 +172,39 @@ def mfem_cuda_enabled() -> bool:
     )
 
 
+def mfem_ceed_enabled() -> bool:
+    """Return whether the loaded MFEM backend was compiled with libCEED."""
+    return bool(
+        _backend_is_mfem(mt_backend)
+        and hasattr(mt_backend, "is_ceed_enabled")
+        and mt_backend.is_ceed_enabled()
+    )
+
+
+def _device_requests_ceed(device: str) -> bool:
+    return "ceed-" in str(device).lower()
+
+
 def _default_mfem_device() -> str:
     return os.environ.get("GMES_MT_MFEM_DEVICE", "cpu")
 
 
 class MTForward3D(nn.Module):
-    def __init__(self, freqs=None, dx=1.0, dy=1.0, dz=1.0, device=None):
+    def __init__(
+        self,
+        freqs=None,
+        dx=1.0,
+        dy=1.0,
+        dz=1.0,
+        device=None,
+        use_partial_assembly=False,
+        npad_xy=10,
+        npad_z=10,
+        alpha=1.4,
+        rel_tol=1e-6,
+        max_iter=2000,
+        verbose=False,
+    ):
         """
         PyTorch wrapper for MFEM/CUDA MT 3D Forward Modeling.
         Args:
@@ -170,7 +215,12 @@ class MTForward3D(nn.Module):
             dy: Cell width in y-direction (m)
             dz: Cell width in z-direction (m)
             device: MFEM device string, e.g. "cpu" or "cuda". If omitted,
-                GMES_MT_MFEM_DEVICE is used when set, otherwise "cpu".
+                GMES_MT_MFEM_DEVICE is used when set, otherwise "cpu". For a
+                libCEED-backed GPU path use strings such as
+                "ceed-cuda:/gpu/cuda/shared".
+            use_partial_assembly: Enable MFEM partial assembly. This is the
+                route needed for device-oriented execution such as CUDA or
+                ceed-cuda.
         """
         super(MTForward3D, self).__init__()
         self.freqs = None if freqs is None else list(freqs)
@@ -179,6 +229,17 @@ class MTForward3D(nn.Module):
         self.dy = dy
         self.dz = dz
         self.device = _default_mfem_device() if device is None else str(device)
+        self.use_partial_assembly = bool(use_partial_assembly)
+        self.npad_xy = int(npad_xy)
+        self.npad_z = int(npad_z)
+        self.alpha = float(alpha)
+        self.rel_tol = float(rel_tol)
+        self.max_iter = int(max_iter)
+        self.verbose = bool(verbose)
+        if _device_requests_ceed(self.device) and not self.use_partial_assembly:
+            raise ValueError(
+                "MFEM CEED devices require use_partial_assembly=True."
+            )
 
     def forward(self, rho_tensor):
         """
@@ -214,6 +275,13 @@ class MTForward3D(nn.Module):
                 self.dy,
                 self.dz,
                 freqs,
+                self.npad_xy,
+                self.npad_z,
+                self.alpha,
+                self.use_partial_assembly,
+                self.rel_tol,
+                self.max_iter,
+                self.verbose,
                 device=self.device,
             )
             app_res = torch.as_tensor(app_res_raw, dtype=torch.float64)

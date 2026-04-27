@@ -61,9 +61,10 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 The Python facade passes MFEM's device string through to the C++ backend:
 
 ```python
-from mt_forward import MTForward3D, mfem_cuda_enabled
+from mt_forward import MTForward3D, mfem_cuda_enabled, mfem_ceed_enabled
 
 print(mfem_cuda_enabled())
+print(mfem_ceed_enabled())
 op = MTForward3D(freqs=[1.0], dx=100.0, dy=100.0, dz=100.0, device="cuda")
 ```
 
@@ -82,24 +83,89 @@ python legacy_cuda/test_forward_debug.py --mfem-device cuda
 This only selects a CUDA backend when the linked MFEM and hypre libraries were
 built with CUDA. A CPU-only MFEM package will reject `device="cuda"` at runtime.
 
-## CUDA-Enabled MFEM
+For a libCEED-backed device path use MFEM's CEED device strings together with
+partial assembly:
 
-MFEM's CUDA backend is a build-time feature. Build or install MFEM with CUDA and
-a matching CUDA-enabled hypre, then rebuild `mt_forward_mfem` against that
-installation. With MFEM's CMake build this means enabling CUDA, for example:
-
-```bash
-cmake -S /path/to/mfem -B /path/to/mfem-build \
-  -DMFEM_USE_MPI=YES \
-  -DMFEM_USE_CUDA=YES \
-  -DCUDA_ARCH=sm_86 \
-  -DCMAKE_INSTALL_PREFIX=/path/to/mfem-cuda-install
-cmake --build /path/to/mfem-build -j
-cmake --install /path/to/mfem-build
+```python
+op = MTForward3D(
+    freqs=[1.0],
+    dx=100.0,
+    dy=100.0,
+    dz=100.0,
+    device="ceed-cuda:/gpu/cuda/shared",
+    use_partial_assembly=True,
+)
 ```
 
-Then rebuild this backend with `CMAKE_PREFIX_PATH` pointing to that CUDA-enabled
-MFEM install.
+The debug script exposes the same route:
+
+```bash
+python legacy_cuda/test_forward_debug.py \
+  --mfem-device "ceed-cuda:/gpu/cuda/shared" \
+  --partial-assembly
+```
+
+`device="ceed-*"` requires `use_partial_assembly=True`.
+
+## Local CUDA Stack Under `.local/`
+
+This repository now includes a helper script that builds a local CUDA-enabled
+stack under `Electrical/forward_modeling/.local/`:
+
+```bash
+source /home/wangyh/anaconda3/bin/activate torch
+
+# Expected source trees. Reuse existing clones or create them first.
+git clone https://github.com/hypre-space/hypre.git /tmp/hypre-cuda-src
+git clone https://github.com/CEED/libCEED.git /tmp/libCEED-cuda-src
+git clone https://github.com/mfem/mfem.git /tmp/mfem-cuda-src
+
+GMESDataset/Electrical/forward_modeling/tools/build_cuda_stack.sh
+```
+
+The script builds:
+
+- CUDA-enabled hypre
+- CUDA-enabled libCEED
+- CUDA-enabled MFEM with `MFEM_USE_CUDA=YES` and `MFEM_USE_CEED=YES`
+- the local `mt_forward_mfem` module against that stack
+
+For the local MFEM CUDA build the script uses a safer
+`CMAKE_CUDA_FLAGS_RELEASE='-O1 -DNDEBUG'`, because `-O3` was enough to trigger
+OOM on this workstation while compiling some large MFEM CUDA translation units.
+It also applies local low-memory MFEM patches before configuring MFEM:
+
+- `DiffusionIntegrator::AssembleEA` uses MFEM's generic EA diffusion kernel
+  instead of fixed-order CUDA specializations.
+- H(div) mass apply and H(div) quadrature interpolation keep their fallback
+  implementations but skip large fixed-order CUDA specialization registration.
+- Batched LOR assembly is compiled as an unsupported stub. This optional MFEM
+  optimization is not used by the MT H(curl) forward path.
+
+It uses the following local prefixes by default:
+
+- `Electrical/forward_modeling/.local/hypre-cuda`
+- `Electrical/forward_modeling/.local/libCEED-cuda`
+- `Electrical/forward_modeling/.local/mfem-cuda`
+
+The default local assumptions match the current workstation:
+
+- CUDA toolkit: `/usr/local/cuda-12.8`
+- host compiler: `/usr/bin/gcc-11`, `/usr/bin/g++-11`
+- CUDA arch for MFEM/hypre: `120`
+- CUDA arch for libCEED: `sm_120`
+
+If you prefer to drive CMake manually, point this backend at the local MFEM
+install with:
+
+```bash
+cmake -S GMESDataset/Electrical/forward_modeling -B /tmp/gmes_forward_modeling_build_cuda \
+  "-DCMAKE_PREFIX_PATH=/home/wangyh/Project/GMESUni/GMESDataset/Electrical/forward_modeling/.local/mfem-cuda;$CONDA_PREFIX" \
+  -DMFEM_DIR=/home/wangyh/Project/GMESUni/GMESDataset/Electrical/forward_modeling/.local/mfem-cuda/lib/cmake/mfem \
+  -DPython3_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+  -Dpybind11_DIR="$CONDA_PREFIX/share/cmake/pybind11"
+cmake --build /tmp/gmes_forward_modeling_build_cuda -j
+```
 
 If MFEM is not installed, Python-side interface tests can still run because they
 mock the backend contract.

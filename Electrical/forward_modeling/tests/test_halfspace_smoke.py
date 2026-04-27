@@ -16,7 +16,22 @@ import mt_forward
 class HalfspaceSmokeBackend:
     __name__ = "mt_forward_mfem"
 
-    def compute_mt_3d(self, rho, dx, dy, dz, freqs):
+    def compute_mt_3d(
+        self,
+        rho,
+        dx,
+        dy,
+        dz,
+        freqs,
+        npad_xy=10,
+        npad_z=10,
+        alpha=1.4,
+        use_partial_assembly=False,
+        rel_tol=1e-6,
+        max_iter=2000,
+        verbose=False,
+        device="cpu",
+    ):
         nx, ny, _ = rho.shape
         app_res = np.empty((len(freqs), nx, ny, 2), dtype=np.float64)
         phase = np.empty_like(app_res)

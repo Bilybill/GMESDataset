@@ -19,7 +19,22 @@ class FakeMfemBackend:
     def __init__(self):
         self.freqs = None
 
-    def compute_mt_3d(self, rho, dx, dy, dz, freqs):
+    def compute_mt_3d(
+        self,
+        rho,
+        dx,
+        dy,
+        dz,
+        freqs,
+        npad_xy=10,
+        npad_z=10,
+        alpha=1.4,
+        use_partial_assembly=False,
+        rel_tol=1e-6,
+        max_iter=2000,
+        verbose=False,
+        device="cpu",
+    ):
         self.freqs = tuple(freqs)
         nx, ny, _ = rho.shape
         app_res = np.zeros((len(freqs), nx, ny, 2), dtype=np.float64)

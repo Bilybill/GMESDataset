@@ -7,6 +7,7 @@
 #include "mt_tensor_model.hpp"
 
 #include "mfem.hpp"
+#include "mfem/linalg/auxiliary.hpp"
 #include <mpi.h>
 
 #include <cctype>
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace gmes::mt
 {
@@ -45,6 +47,15 @@ bool DeviceStringRequestsCuda(std::string device)
     return device.find("cuda") != std::string::npos;
 }
 
+bool DeviceStringRequestsCeed(std::string device)
+{
+    for (char& ch : device)
+    {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return device.find("ceed-") != std::string::npos;
+}
+
 } // namespace
 
 struct MT3DForwardSolver::Impl
@@ -62,6 +73,15 @@ struct MT3DForwardSolver::Impl
                 "CUDA support, then rebuild mt_forward_mfem.");
         }
 #endif
+#ifndef MFEM_USE_CEED
+        if (DeviceStringRequestsCeed(input.solver.device))
+        {
+            throw std::runtime_error(
+                "An MFEM CEED device was requested, but the linked MFEM library "
+                "was built without MFEM_USE_CEED=YES. Rebuild MFEM with "
+                "libCEED enabled, then rebuild mt_forward_mfem.");
+        }
+#endif
         device.Configure(input.solver.device.c_str());
         if (input.solver.verbose)
         {
@@ -69,7 +89,18 @@ struct MT3DForwardSolver::Impl
         }
 
         serial_mesh = BuildTensorHexMesh(input, &axes);
-        pmesh = std::make_unique<ParMesh>(MPI_COMM_WORLD, *serial_mesh);
+
+        int nranks = 1;
+        MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+        std::vector<int> partitioning(
+            static_cast<std::size_t>(serial_mesh->GetNE()));
+        for (int i = 0; i < serial_mesh->GetNE(); ++i)
+        {
+            partitioning[static_cast<std::size_t>(i)] = i % nranks;
+        }
+        pmesh = std::make_unique<ParMesh>(MPI_COMM_WORLD,
+                                          *serial_mesh,
+                                          partitioning.data());
 
         fec = std::make_unique<ND_FECollection>(input.solver.order, 3);
         fes = std::make_unique<ParFiniteElementSpace>(pmesh.get(), fec.get());
@@ -94,11 +125,12 @@ MT3DForwardSolver::~MT3DForwardSolver() = default;
 
 MTResponse MT3DForwardSolver::Run()
 {
-    if (impl_->input.solver.use_partial_assembly)
+    if (DeviceStringRequestsCeed(impl_->input.solver.device) &&
+        !impl_->input.solver.use_partial_assembly)
     {
         throw std::runtime_error(
-            "Partial assembly is intentionally disabled in the first MFEM migration slice. "
-            "Use assembled operators with HypreAMS for low-frequency robustness.");
+            "MFEM CEED devices require use_partial_assembly=True so the "
+            "operator is assembled in matrix-free form.");
     }
 
     Array<int> ess_bdr = BuildEssentialBoundaryMask(*impl_->pmesh);
@@ -150,6 +182,10 @@ MTResponse MT3DForwardSolver::Run()
             form.AddDomainIntegrator(new CurlCurlIntegrator(curl_coeff), nullptr);
             form.AddDomainIntegrator(nullptr,
                                      new VectorFEMassIntegrator(omega_mu_sigma));
+            if (impl_->input.solver.use_partial_assembly)
+            {
+                form.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+            }
             form.Assemble();
 
             OperatorPtr system_operator;
@@ -161,22 +197,11 @@ MTResponse MT3DForwardSolver::Run()
                 new CurlCurlIntegrator(curl_coeff));
             preconditioner_form.AddDomainIntegrator(
                 new VectorFEMassIntegrator(omega_mu_sigma));
-            preconditioner_form.Assemble();
-            preconditioner_form.Finalize();
-
-            OperatorPtr preconditioner_operator;
-            preconditioner_form.FormSystemMatrix(ess_tdof_list,
-                                                 preconditioner_operator);
-
-            HypreParMatrix* assembled_matrix =
-                preconditioner_operator.As<HypreParMatrix>();
-            if (assembled_matrix == nullptr)
+            if (impl_->input.solver.use_partial_assembly)
             {
-                throw std::runtime_error(
-                    "Expected an assembled HypreParMatrix for HypreAMS.");
+                preconditioner_form.SetAssemblyLevel(AssemblyLevel::PARTIAL);
             }
-
-            HypreAMS ams(*assembled_matrix, impl_->fes.get());
+            preconditioner_form.Assemble();
 
             Array<int> block_offsets(3);
             block_offsets[0] = 0;
@@ -185,8 +210,44 @@ MTResponse MT3DForwardSolver::Run()
             block_offsets.PartialSum();
 
             BlockDiagonalPreconditioner block_preconditioner(block_offsets);
-            block_preconditioner.SetDiagonalBlock(0, &ams);
-            block_preconditioner.SetDiagonalBlock(1, &ams);
+            OperatorPtr preconditioner_operator;
+
+            std::unique_ptr<Solver> pa_ams;
+            std::unique_ptr<HypreAMS> assembled_ams;
+            if (impl_->input.solver.use_partial_assembly)
+            {
+                preconditioner_form.FormSystemMatrix(ess_tdof_list,
+                                                     preconditioner_operator);
+                pa_ams = std::make_unique<MatrixFreeAMS>(
+                    preconditioner_form,
+                    *preconditioner_operator.Ptr(),
+                    *impl_->fes,
+                    &curl_coeff,
+                    &omega_mu_sigma,
+                    nullptr,
+                    ess_bdr);
+                block_preconditioner.SetDiagonalBlock(0, pa_ams.get());
+                block_preconditioner.SetDiagonalBlock(1, pa_ams.get());
+            }
+            else
+            {
+                preconditioner_form.Finalize();
+                preconditioner_form.FormSystemMatrix(ess_tdof_list,
+                                                     preconditioner_operator);
+
+                HypreParMatrix* assembled_matrix =
+                    preconditioner_operator.As<HypreParMatrix>();
+                if (assembled_matrix == nullptr)
+                {
+                    throw std::runtime_error(
+                        "Expected an assembled HypreParMatrix for HypreAMS.");
+                }
+
+                assembled_ams =
+                    std::make_unique<HypreAMS>(*assembled_matrix, impl_->fes.get());
+                block_preconditioner.SetDiagonalBlock(0, assembled_ams.get());
+                block_preconditioner.SetDiagonalBlock(1, assembled_ams.get());
+            }
 
             GMRESSolver gmres(MPI_COMM_WORLD);
             gmres.SetPrintLevel(impl_->input.solver.verbose ? 1 : 0);
