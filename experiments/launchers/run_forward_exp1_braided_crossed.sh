@@ -30,6 +30,7 @@
 #   TASK_FILTER=joint_multiphysics MODEL_FILTER=fno bash experiments/launchers/run_forward_exp1_braided_crossed.sh
 #   FORWARD_OUTPUT_ROOT=/tmp/forward_exp1 EXP1_PHASE=phase3 bash experiments/launchers/run_forward_exp1_braided_crossed.sh
 #   DEVICE=cuda:1 EXP1_PHASE=phase3 SEISMIC_SHOT_BATCH_SIZE=3 bash experiments/launchers/run_forward_exp1_braided_crossed.sh
+#   DEVICE=cuda:1 EXP1_PHASE=phase3 SEISMIC_SHOT_BATCH_SIZE=3 SEISMIC_SHOT_EPOCHS=50 SEISMIC_SHOT_LR=5e-4 SEISMIC_SHOT_WEIGHT_DECAY=1e-4 SEISMIC_SHOT_NUM_WORKERS=8 bash experiments/launchers/run_forward_exp1_braided_crossed.sh
 #
 # Dry run:
 #   SKIP_CONDA_ACTIVATE=1 DRY_RUN=1 bash experiments/launchers/run_forward_exp1_braided_crossed.sh

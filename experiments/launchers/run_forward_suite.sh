@@ -30,6 +30,22 @@ for task in "${FORWARD_TASKS[@]}"; do
   batch_size="${FORWARD_BATCH_SIZE[$task]}"
   epochs="${FORWARD_EPOCHS[$task]}"
   lr="${FORWARD_LR[$task]}"
+  weight_decay="${FORWARD_WEIGHT_DECAY}"
+  num_workers="${FORWARD_NUM_WORKERS}"
+
+  if declare -p FORWARD_TASK_WEIGHT_DECAY >/dev/null 2>&1; then
+    task_weight_decay="${FORWARD_TASK_WEIGHT_DECAY[$task]:-}"
+    if [[ -n "${task_weight_decay}" ]]; then
+      weight_decay="${task_weight_decay}"
+    fi
+  fi
+
+  if declare -p FORWARD_TASK_NUM_WORKERS >/dev/null 2>&1; then
+    task_num_workers="${FORWARD_TASK_NUM_WORKERS[$task]:-}"
+    if [[ -n "${task_num_workers}" ]]; then
+      num_workers="${task_num_workers}"
+    fi
+  fi
 
   models_for_task=("${FORWARD_MODELS[@]}")
   if declare -p FORWARD_TASK_MODELS >/dev/null 2>&1; then
@@ -60,8 +76,8 @@ for task in "${FORWARD_TASKS[@]}"; do
       --batch-size "${batch_size}"
       --epochs "${epochs}"
       --lr "${lr}"
-      --weight-decay "${FORWARD_WEIGHT_DECAY}"
-      --num-workers "${FORWARD_NUM_WORKERS}"
+      --weight-decay "${weight_decay}"
+      --num-workers "${num_workers}"
       --val-fraction "${FORWARD_VAL_FRACTION}"
       --seed "${FORWARD_SEED}"
       --max-train-samples "${FORWARD_MAX_TRAIN_SAMPLES}"
@@ -74,6 +90,9 @@ for task in "${FORWARD_TASKS[@]}"; do
     fi
     if [[ "${#FORWARD_HELDOUT_SOURCE_PREFIXES[@]}" -gt 0 ]]; then
       train_cmd+=(--heldout-source-prefixes "${FORWARD_HELDOUT_SOURCE_PREFIXES[@]}")
+    fi
+    if [[ "${FORWARD_RESUME:-0}" == "1" ]]; then
+      train_cmd+=(--resume)
     fi
     run_logged_command "${log_path}" "${train_cmd[@]}"
 
@@ -89,7 +108,7 @@ for task in "${FORWARD_TASKS[@]}"; do
       --include-top-levels "${INCLUDE_TOP_LEVELS[@]}"
       --device "${FORWARD_DEVICE}"
       --batch-size "${batch_size}"
-      --num-workers "${FORWARD_NUM_WORKERS}"
+      --num-workers "${num_workers}"
       --val-fraction "${FORWARD_VAL_FRACTION}"
       --seed "${FORWARD_SEED}"
       --split heldout

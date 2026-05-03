@@ -13,8 +13,14 @@ project_root() {
 activate_conda_env_if_needed() {
   local conda_env="${CONDA_ENV:-torch}"
   local conda_sh="${CONDA_SH:-/home/wangyh/anaconda3/etc/profile.d/conda.sh}"
+  local had_nounset=0
+  local status=0
 
   if [[ "${SKIP_CONDA_ACTIVATE:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ "${CONDA_DEFAULT_ENV:-}" == "${conda_env}" ]]; then
     return 0
   fi
 
@@ -23,9 +29,20 @@ activate_conda_env_if_needed() {
     return 1
   fi
 
+  if [[ "$-" == *u* ]]; then
+    had_nounset=1
+    set +u
+  fi
+
   # shellcheck disable=SC1090
   source "${conda_sh}"
-  conda activate "${conda_env}"
+  conda activate "${conda_env}" || status=$?
+
+  if [[ "${had_nounset}" == "1" ]]; then
+    set -u
+  fi
+
+  return "${status}"
 }
 
 matches_optional_filter() {

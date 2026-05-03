@@ -274,6 +274,7 @@ def parse_args():
     parser.add_argument("--max-val-samples", type=int, default=0, help="Optional validation-set cap for smoke tests.")
     parser.add_argument("--max-heldout-samples", type=int, default=0, help="Optional held-out-set cap for smoke tests.")
     parser.add_argument("--output-root", type=str, default=default_output_root)
+    parser.add_argument("--resume", action="store_true", help="Resume training from output-root/<task>_<model>/last_model.pt.")
     return parser.parse_args()
 
 
@@ -350,6 +351,71 @@ def main():
     best_epoch_record = None
     best_ckpt_path = os.path.join(output_dir, "best_model.pt")
     last_ckpt_path = os.path.join(output_dir, "last_model.pt")
+    metrics_path = os.path.join(output_dir, "metrics.json")
+    start_epoch = 1
+
+    def refresh_best_from_history() -> None:
+        nonlocal best_val, best_epoch, best_epoch_record
+        best_val = float("inf")
+        best_epoch = 0
+        best_epoch_record = None
+        for record in history:
+            val_rl2 = float(record.get("val", {}).get("relative_l2", float("inf")))
+            if val_rl2 < best_val:
+                best_val = val_rl2
+                best_epoch = int(record.get("epoch", 0))
+                best_epoch_record = record
+
+    if args.resume:
+        if not os.path.exists(last_ckpt_path):
+            raise FileNotFoundError(f"Cannot resume because last checkpoint does not exist: {last_ckpt_path}")
+        checkpoint = torch.load(last_ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        history = list(checkpoint.get("history", []))
+        start_epoch = int(checkpoint.get("epoch", len(history))) + 1
+        refresh_best_from_history()
+        print(f"[resume] Loaded checkpoint: {last_ckpt_path}")
+        print(f"[resume] Continuing from epoch {start_epoch} / {args.epochs}. Best epoch so far: {best_epoch}")
+
+    def write_metrics_snapshot() -> None:
+        if not history:
+            return
+        final_epoch_record = history[-1]
+        results = {
+            "task": args.task,
+            "model": args.model,
+            "device": str(device),
+            "splits": {
+                "train_size": len(train_dataset),
+                "val_size": len(val_dataset),
+                "heldout_size": len(heldout_dataset),
+            },
+            "sample_shapes": {
+                "inputs": _shape_tree(sample["inputs"]),
+                "targets": output_specs,
+            },
+            "target_scales": target_scales,
+            "paths": {
+                "output_dir": output_dir,
+                "best_checkpoint": best_ckpt_path,
+                "last_checkpoint": last_ckpt_path,
+            },
+            "selection": {
+                "metric": "val.relative_l2",
+                "best_epoch": best_epoch,
+            },
+            "summary": {
+                "best_validation": _format_metric_block(best_epoch_record["val"]) if best_epoch_record is not None else {},
+                "heldout_at_best_validation": _format_metric_block(best_epoch_record["heldout"]) if best_epoch_record is not None else {},
+                "final_validation": _format_metric_block(final_epoch_record["val"]),
+                "final_heldout": _format_metric_block(final_epoch_record["heldout"]),
+            },
+            "history": history,
+        }
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=True, indent=2)
 
     print("====== GMES-3D Forward Surrogate Training ======")
     print(f"Task      : {args.task}")
@@ -363,7 +429,10 @@ def main():
         print(f"TargetSc. : {json.dumps(target_scales, ensure_ascii=True)}")
     print(f"Output dir: {output_dir}")
 
-    for epoch in range(1, args.epochs + 1):
+    if start_epoch > args.epochs:
+        print(f"[resume] Checkpoint epoch {start_epoch - 1} already reaches requested epochs={args.epochs}.")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = run_epoch(model, train_loader, optimizer, device, training=True, target_scales=target_scales)
         with torch.no_grad():
             val_metrics = run_epoch(model, val_loader, optimizer=None, device=device, training=False, target_scales=target_scales)
@@ -394,6 +463,7 @@ def main():
             "args": vars(args),
             "epoch": epoch,
             "history": history,
+            "optimizer_state_dict": optimizer.state_dict(),
             "sample_shapes": {
                 "inputs": _shape_tree(sample["inputs"]),
                 "targets": output_specs,
@@ -407,42 +477,9 @@ def main():
             best_epoch = epoch
             best_epoch_record = epoch_record
             torch.save(state, best_ckpt_path)
+        write_metrics_snapshot()
 
-    final_epoch_record = history[-1]
-    results = {
-        "task": args.task,
-        "model": args.model,
-        "device": str(device),
-        "splits": {
-            "train_size": len(train_dataset),
-            "val_size": len(val_dataset),
-            "heldout_size": len(heldout_dataset),
-        },
-        "sample_shapes": {
-            "inputs": _shape_tree(sample["inputs"]),
-            "targets": output_specs,
-        },
-        "target_scales": target_scales,
-        "paths": {
-            "output_dir": output_dir,
-            "best_checkpoint": best_ckpt_path,
-            "last_checkpoint": last_ckpt_path,
-        },
-        "selection": {
-            "metric": "val.relative_l2",
-            "best_epoch": best_epoch,
-        },
-        "summary": {
-            "best_validation": _format_metric_block(best_epoch_record["val"]) if best_epoch_record is not None else {},
-            "heldout_at_best_validation": _format_metric_block(best_epoch_record["heldout"]) if best_epoch_record is not None else {},
-            "final_validation": _format_metric_block(final_epoch_record["val"]),
-            "final_heldout": _format_metric_block(final_epoch_record["heldout"]),
-        },
-        "history": history,
-    }
-    metrics_path = os.path.join(output_dir, "metrics.json")
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=True, indent=2)
+    write_metrics_snapshot()
     print(f"[+] Saved metrics to {metrics_path}")
     print(f"[+] Saved best checkpoint to {best_ckpt_path}")
 

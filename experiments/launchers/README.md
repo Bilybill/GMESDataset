@@ -1,6 +1,6 @@
 # GMES-3D Experiment Launchers
 
-These launchers are intended for direct server-side submission of the current forward-modeling and anomaly-classification benchmarks.
+These launchers are intended for direct server-side submission of the current forward-modeling, joint-inversion, and anomaly-classification benchmarks.
 
 ## Forward suite
 
@@ -57,6 +57,33 @@ RUN_FILTER="mt,seismic,all_modalities" \
 bash experiments/launchers/run_classification_suite.sh
 ```
 
+## Joint inversion suite
+
+The joint inversion baseline maps multiphysics responses
+`gravity + magnetic + MT + seismic` to co-registered 3D property volumes
+`vp + rho + res + chi`.
+
+Default run:
+
+```bash
+bash experiments/launchers/run_joint_inversion_suite.sh
+```
+
+Run on GPU 1:
+
+```bash
+INVERSION_DEVICE=cuda:1 bash experiments/launchers/run_joint_inversion_suite.sh
+```
+
+Use a larger 3D target grid:
+
+```bash
+INVERSION_TARGET_SHAPE="128 128 128" \
+INVERSION_BATCH_SIZE=1 \
+INVERSION_DEVICE=cuda:1 \
+bash experiments/launchers/run_joint_inversion_suite.sh
+```
+
 ## Useful environment overrides
 
 - `CONDA_ENV=torch`: conda environment to activate
@@ -66,17 +93,21 @@ bash experiments/launchers/run_classification_suite.sh
 - `MODEL_FILTER=...`: comma-separated forward-model filter
 - `RUN_FILTER=...`: comma-separated classification-run filter
 - `EXP1_PHASE=phase1|phase2|phase3|phase4|full`: staged execution for the forward Experiment 1 launcher
+- `INVERSION_DEVICE=cuda:1`: device for joint inversion
+- `INVERSION_TARGET_SHAPE="64 64 64"`: output grid for joint inversion targets
 
 ## Config files
 
 - `experiments/configs/forward/default_suite.sh`
 - `experiments/configs/forward/exp1_braided_crossed.sh`
+- `experiments/configs/inversion/default_suite.sh`
 - `experiments/configs/classification/default_suite.sh`
 
 To use a custom config, pass its path as the first argument:
 
 ```bash
 bash experiments/launchers/run_forward_suite.sh /path/to/custom_forward_config.sh
+bash experiments/launchers/run_joint_inversion_suite.sh /path/to/custom_inversion_config.sh
 bash experiments/launchers/run_classification_suite.sh /path/to/custom_classification_config.sh
 ```
 

@@ -53,7 +53,18 @@ declare -A FORWARD_TASK_MODELS=(
   ["joint_multiphysics"]="unet fno"
 )
 
-# The shot-conditioned seismic task is the memory-heavy phase. On a 96GB GPU,
-# batch size 2 is a safer default than 1 while leaving headroom for validation
-# and checkpointing. Try SEISMIC_SHOT_BATCH_SIZE=3 if GPU memory remains low.
-FORWARD_BATCH_SIZE["vp_source_to_seismic_shot"]="${SEISMIC_SHOT_BATCH_SIZE:-2}"
+# Phase-3 dedicated overrides for the shot-conditioned seismic benchmark.
+# These env vars affect only vp_source_to_seismic_shot when this config is used.
+FORWARD_BATCH_SIZE["vp_source_to_seismic_shot"]="${SEISMIC_SHOT_BATCH_SIZE:-3}"
+FORWARD_EPOCHS["vp_source_to_seismic_shot"]="${SEISMIC_SHOT_EPOCHS:-50}"
+FORWARD_LR["vp_source_to_seismic_shot"]="${SEISMIC_SHOT_LR:-5e-4}"
+
+declare -A FORWARD_TASK_WEIGHT_DECAY=(
+  ["vp_source_to_seismic_shot"]="${SEISMIC_SHOT_WEIGHT_DECAY:-1e-4}"
+)
+
+declare -A FORWARD_TASK_NUM_WORKERS=(
+  ["vp_source_to_seismic_shot"]="${SEISMIC_SHOT_NUM_WORKERS:-8}"
+)
+
+FORWARD_SEED="${SEISMIC_SHOT_SEED:-42}"

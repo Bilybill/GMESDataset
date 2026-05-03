@@ -170,6 +170,40 @@ FORWARD_TASK_SPECS = {
 }
 
 
+def _required_bundle_keys(task_name: str, available_keys) -> list[str]:
+    optional_keys = {"mt_freqs_hz", "seismic_freq_hz"}
+    task_keys = {
+        "rho_to_gravity": ("rho_model", "gravity_data"),
+        "chi_to_magnetic": ("chi_model", "magnetic_data"),
+        "res_to_mt": ("res_model", "mt_app_res", "mt_phase", "mt_freqs_hz"),
+        "vp_to_seismic": ("vp_model", "seismic_data"),
+        "vp_source_to_seismic_shot": (
+            "vp_model",
+            "seismic_data",
+            "seismic_source_locations",
+            "seismic_freq_hz",
+        ),
+        "joint_multiphysics": (
+            "vp_model",
+            "rho_model",
+            "res_model",
+            "chi_model",
+            "gravity_data",
+            "magnetic_data",
+            "mt_app_res",
+            "mt_phase",
+            "mt_freqs_hz",
+            "seismic_data",
+        ),
+    }
+    available = set(available_keys)
+    return [
+        key
+        for key in task_keys[task_name]
+        if key in available or key not in optional_keys
+    ]
+
+
 def _to_tensor_tree(array_or_tree):
     if torch is None:
         return array_or_tree
@@ -237,8 +271,17 @@ class GMESForwardDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         record = self.records[index]
-        with np.load(record["bundle_path"], allow_pickle=True) as bundle:
-            bundle_dict = {key: bundle[key] for key in bundle.files}
+        bundle_path = record["bundle_path"]
+        try:
+            with np.load(bundle_path, allow_pickle=True) as bundle:
+                bundle_dict = {}
+                for key in _required_bundle_keys(self.task.name, bundle.files):
+                    try:
+                        bundle_dict[key] = bundle[key]
+                    except OSError as exc:
+                        raise OSError(f"failed reading key '{key}' from {bundle_path}: {exc}") from exc
+        except OSError as exc:
+            raise OSError(f"failed loading forward bundle for task '{self.task.name}': {bundle_path}: {exc}") from exc
         if self.task.name == "vp_source_to_seismic_shot":
             input_array = _build_vp_source_input(bundle_dict)
         else:
